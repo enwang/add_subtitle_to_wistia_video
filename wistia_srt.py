@@ -64,7 +64,7 @@ def ffmpeg_subtitles_arg(path: Path) -> str:
         "BorderStyle=3,"
         "Outline=1,"
         "Shadow=0,"
-        "MarginV=28,"
+        "MarginV=15,"
         "Alignment=2"
     )
     return f"subtitles=filename='{raw}':force_style='{style}'"
