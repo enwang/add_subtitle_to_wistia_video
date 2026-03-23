@@ -1,6 +1,6 @@
 # Add Subtitle To Wistia Video
 
-Downloads a Wistia video, transcribes Cantonese or Mandarin speech to Chinese subtitles by default, and burns those subtitles into a final MP4.
+Downloads a Wistia video, transcribes Cantonese or Mandarin speech to Chinese subtitles by default, burns those subtitles into a final MP4, and generates a companion PDF summary focused on the core message and named themes from the transcript.
 
 ## Wistia URL → subtitled MP4
 
@@ -12,6 +12,12 @@ The default output file is written to:
 
 ```bash
 ~/Downloads/<video-id>.subtitled.mp4
+```
+
+The PDF summary is written next to it:
+
+```bash
+~/Downloads/<video-id>.subtitled.summary.pdf
 ```
 
 ## Already-downloaded MP4 → subtitled MP4
@@ -52,4 +58,22 @@ Use a faster model:
 
 ```bash
 /Users/welsnake/jlaw_video/.venv/bin/python /Users/welsnake/jlaw_video/wistia_srt.py "YOUR_WISTIA_URL" --model turbo
+```
+
+Use a short clip for speed testing:
+
+```bash
+/Users/welsnake/jlaw_video/.venv/bin/python /Users/welsnake/jlaw_video/wistia_srt.py "YOUR_WISTIA_URL" --start 00:01:00 --duration 00:00:20 --model turbo
+```
+
+Skip the PDF summary:
+
+```bash
+/Users/welsnake/jlaw_video/.venv/bin/python /Users/welsnake/jlaw_video/wistia_srt.py "YOUR_WISTIA_URL" --skip-summary-pdf
+```
+
+Add representative frame pages to the PDF:
+
+```bash
+/Users/welsnake/jlaw_video/.venv/bin/python /Users/welsnake/jlaw_video/wistia_srt.py "YOUR_WISTIA_URL" --include-summary-images
 ```
