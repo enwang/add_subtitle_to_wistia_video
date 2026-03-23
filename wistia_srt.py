@@ -7,10 +7,19 @@ import re
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
 
 from faster_whisper import WhisperModel
+from summary_pdf import build_summary_pdf
+
+
+@dataclass
+class SubtitleSegment:
+    start: float
+    end: float
+    text: str
 
 
 def ffmpeg_binary() -> str | None:
@@ -45,6 +54,23 @@ def clock_timestamp(seconds: float) -> str:
     hours, rem = divmod(total_seconds, 3600)
     minutes, secs = divmod(rem, 60)
     return f"{hours:02}:{minutes:02}:{secs:02}"
+
+
+def elapsed_label(seconds: float) -> str:
+    return f"{seconds:.1f}s"
+
+
+def ffmpeg_escape(value: str) -> str:
+    return value.replace("\\", "\\\\").replace(":", r"\:").replace("'", r"\'")
+
+
+def clip_args(start: str | None, duration: str | None) -> list[str]:
+    args: list[str] = []
+    if start:
+        args.extend(["-ss", start])
+    if duration:
+        args.extend(["-t", duration])
+    return args
 
 
 def safe_stem(url: str) -> str:
@@ -114,6 +140,24 @@ def media_duration_seconds(path: Path) -> float | None:
     return duration if duration > 0 else None
 
 
+def wrap_text_block(text: str, width: int) -> list[str]:
+    lines: list[str] = []
+    for paragraph in text.splitlines():
+        paragraph = paragraph.strip()
+        if not paragraph:
+            lines.append("")
+            continue
+        wrapped = textwrap.wrap(
+            paragraph,
+            width=width,
+            break_long_words=True,
+            break_on_hyphens=False,
+            replace_whitespace=False,
+        )
+        lines.extend(wrapped or [""])
+    return lines
+
+
 def write_srt(
     audio_path: Path,
     srt_path: Path,
@@ -122,11 +166,14 @@ def write_srt(
     compute_type: str,
     task: str,
     language: str | None,
-) -> int:
+) -> tuple[int, dict[str, float], list[SubtitleSegment], str | None]:
+    model_load_started = time.monotonic()
     model = WhisperModel(model_name, device=device, compute_type=compute_type)
+    model_load_elapsed = time.monotonic() - model_load_started
     transcribe_args = {"task": task, "beam_size": 5, "vad_filter": True}
     if language:
         transcribe_args["language"] = language
+    transcribe_started = time.monotonic()
     segments, info = model.transcribe(str(audio_path), **transcribe_args)
     duration = media_duration_seconds(audio_path)
     start_time = time.monotonic()
@@ -139,12 +186,16 @@ def write_srt(
         )
 
     written = 0
+    subtitle_segments: list[SubtitleSegment] = []
     with srt_path.open("w", encoding="utf-8") as handle:
         for segment in segments:
             text = segment.text.strip()
             if not text:
                 continue
             written += 1
+            subtitle_segments.append(
+                SubtitleSegment(start=segment.start, end=segment.end, text=text)
+            )
             handle.write(
                 f"{written}\n"
                 f"{timestamp(segment.start)} --> {timestamp(segment.end)}\n"
@@ -179,7 +230,10 @@ def write_srt(
             f"ETA 00:00:00, elapsed {clock_timestamp(total_elapsed)}",
             flush=True,
         )
-    return written
+    return written, {
+        "model_load": model_load_elapsed,
+        "transcribe": time.monotonic() - transcribe_started,
+    }, subtitle_segments, info.language
 
 
 def parse_args() -> argparse.Namespace:
@@ -223,6 +277,24 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Keep the downloaded source MP4, extracted audio, and generated SRT file.",
     )
+    parser.add_argument(
+        "--start",
+        help="Optional clip start time for short test runs, for example 00:01:00.",
+    )
+    parser.add_argument(
+        "--duration",
+        help="Optional clip duration for short test runs, for example 00:00:20.",
+    )
+    parser.add_argument(
+        "--skip-summary-pdf",
+        action="store_true",
+        help="Skip generating the companion PDF summary file.",
+    )
+    parser.add_argument(
+        "--include-summary-images",
+        action="store_true",
+        help="Add representative frame pages to the PDF summary.",
+    )
     return parser.parse_args()
 
 
@@ -241,19 +313,29 @@ def main() -> int:
     source_path = output_path.with_name(f"{output_path.stem}.source.mp4")
     audio_path = output_path.with_suffix(".m4a")
     srt_path = output_path.with_suffix(".srt")
+    pdf_summary_path = output_path.with_suffix(".summary.pdf")
+    timings: dict[str, float] = {}
+    total_started = time.monotonic()
+    subtitle_segments: list[SubtitleSegment] = []
+    detected_language: str | None = None
 
     try:
+        stage_started = time.monotonic()
         run(
             [
                 ffmpeg,
                 "-y",
                 "-i",
                 input_url,
+                *clip_args(args.start, args.duration),
                 "-c",
                 "copy",
                 str(source_path),
             ]
         )
+        timings["download"] = time.monotonic() - stage_started
+
+        stage_started = time.monotonic()
         run(
             [
                 ffmpeg,
@@ -270,7 +352,9 @@ def main() -> int:
                 str(audio_path),
             ]
         )
-        subtitle_count = write_srt(
+        timings["audio_extract"] = time.monotonic() - stage_started
+
+        subtitle_count, transcription_timings, subtitle_segments, detected_language = write_srt(
             audio_path,
             srt_path,
             args.model,
@@ -279,7 +363,9 @@ def main() -> int:
             args.task,
             args.language,
         )
+        timings.update(transcription_timings)
         if subtitle_count:
+            stage_started = time.monotonic()
             run(
                 [
                     ffmpeg,
@@ -293,9 +379,28 @@ def main() -> int:
                     str(output_path),
                 ]
             )
+            timings["subtitle_burn"] = time.monotonic() - stage_started
         else:
             print("No subtitle segments were generated; writing the downloaded video without burned subtitles.")
+            stage_started = time.monotonic()
             run([ffmpeg, "-y", "-i", str(source_path), "-c", "copy", str(output_path)])
+            timings["copy_output"] = time.monotonic() - stage_started
+
+        if not args.skip_summary_pdf:
+            stage_started = time.monotonic()
+            print("Generating PDF summary...", flush=True)
+            build_summary_pdf(
+                ffmpeg,
+                output_path,
+                pdf_summary_path,
+                subtitle_segments,
+                subtitle_count,
+                detected_language,
+                input_url,
+                args.include_summary_images,
+                ffprobe_binary(),
+            )
+            timings["summary_pdf"] = time.monotonic() - stage_started
     except subprocess.CalledProcessError as exc:
         print(f"Command failed with exit code {exc.returncode}.", file=sys.stderr)
         return exc.returncode
@@ -310,7 +415,24 @@ def main() -> int:
                 except FileNotFoundError:
                     pass
 
+    timings["total"] = time.monotonic() - total_started
+    print("Stage timings:", flush=True)
+    for label in (
+        "download",
+        "audio_extract",
+        "model_load",
+        "transcribe",
+        "subtitle_burn",
+        "copy_output",
+        "summary_pdf",
+        "total",
+    ):
+        if label in timings:
+            print(f"  {label}: {elapsed_label(timings[label])}", flush=True)
+
     print(f"Wrote {output_path}")
+    if not args.skip_summary_pdf:
+        print(f"Wrote {pdf_summary_path}")
     return 0
 
 
