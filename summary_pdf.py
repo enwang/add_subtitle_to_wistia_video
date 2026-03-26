@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import concurrent.futures
+import json
+import os
 import re
 import subprocess
 import tempfile
@@ -47,7 +50,8 @@ def build_summary_pdf(
 ) -> None:
     del subtitle_count, detected_language, input_url
     theme_sections = build_theme_sections(segments)
-    summary_blocks = build_summary_blocks(segments, theme_sections)
+    llm_summary = generate_llm_summary(segments)
+    summary_blocks = build_summary_blocks(segments, theme_sections, llm_summary=llm_summary)
 
     with tempfile.TemporaryDirectory(prefix="video_summary_") as tmp_dir:
         tmp_root = Path(tmp_dir)
@@ -381,6 +385,150 @@ def build_theme_sections(segments: list[SubtitleLike]) -> list[ThemeSection]:
     return merged
 
 
+def _fmt_time(seconds: float) -> str:
+    total = int(round(seconds))
+    h, rem = divmod(total, 3600)
+    m, sec = divmod(rem, 60)
+    return f"{h:02}:{m:02}:{sec:02}"
+
+
+def _chunk_transcript(segments: list[SubtitleLike], chunk_minutes: float = 15.0) -> list[tuple[float, float, str]]:
+    """Split segments into time-based chunks. Returns list of (start, end, text)."""
+    if not segments:
+        return []
+    chunk_secs = chunk_minutes * 60
+    chunks: list[tuple[float, float, str]] = []
+    current_texts: list[str] = []
+    chunk_start = segments[0].start
+    chunk_end_target = chunk_start + chunk_secs
+    for seg in segments:
+        current_texts.append(seg.text.strip())
+        if seg.end >= chunk_end_target:
+            text = normalize_summary_text(" ".join(t for t in current_texts if t))
+            if text:
+                chunks.append((chunk_start, seg.end, text))
+            current_texts = []
+            chunk_start = seg.end
+            chunk_end_target = chunk_start + chunk_secs
+    if current_texts:
+        text = normalize_summary_text(" ".join(t for t in current_texts if t))
+        if text:
+            chunks.append((chunk_start, segments[-1].end, text))
+    return chunks
+
+
+def _map_chunk(client: object, chunk_index: int, total_chunks: int, start: float, end: float, text: str) -> str:
+    """Summarize a single transcript chunk with Claude Haiku (map phase)."""
+    prompt = (
+        f"以下是一段粤语/普通话财经视频的第 {chunk_index}/{total_chunks} 段字幕"
+        f"（时间 {_fmt_time(start)} - {_fmt_time(end)}）。\n\n"
+        "请用简体中文总结这段内容，包括：\n"
+        "1. 主要讨论的话题、主题或股票方向\n"
+        "2. 提到的所有股票代码和公司名称（尽量完整）\n"
+        "3. 具体的数据指标（涨跌幅、价格区间、筛选条件等）\n"
+        "4. 讲者的核心观点和分析逻辑\n\n"
+        f"字幕内容：\n{text}\n\n"
+        "请输出结构化段落总结（用完整中文句子，不要用bullet points）。"
+    )
+    import anthropic as _anthropic
+    response = _anthropic.Anthropic().messages.create(
+        model="claude-haiku-4-5-20251001",  # cheapest model
+        max_tokens=900,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.0,
+    )
+    return response.content[0].text  # type: ignore[union-attr]
+
+
+def _reduce_summary(client: object, chunk_summaries: list[str], all_tickers: list[str]) -> dict:
+    """Synthesize chunk summaries into a structured final summary (reduce phase)."""
+    summaries_text = "\n\n".join(f"【第{i + 1}段总结】\n{s}" for i, s in enumerate(chunk_summaries))
+    tickers_str = "、".join(all_tickers[:20]) if all_tickers else "（未检测到）"
+    prompt = (
+        "以下是一个约2小时粤语财经视频的分段总结，请整合成一份完整的视频摘要。\n\n"
+        f"视频中提到的股票代码：{tickers_str}\n\n"
+        f"分段总结：\n{summaries_text}\n\n"
+        "请严格输出以下JSON格式（所有内容用简体中文，每个段落至少2-3句话，内容要具体）：\n\n"
+        '{\n'
+        '  "intro_paragraphs": [\n'
+        '    "核心结论段落1（总结视频目标和主要发现）",\n'
+        '    "核心结论段落2（讲者强调的重点方法或发现）",\n'
+        '    "核心结论段落3（视频的实用价值和应用方式）"\n'
+        '  ],\n'
+        '  "method_paragraphs": [\n'
+        '    "筛选方法段落1（具体筛选条件和数据指标）",\n'
+        '    "筛选方法段落2（如何应用这些条件）",\n'
+        '    "筛选方法段落3（筛选结果的分析步骤）"\n'
+        '  ],\n'
+        '  "themes": [\n'
+        '    {\n'
+        '      "title": "主题名称",\n'
+        '      "paragraphs": ["段落1（背景和逻辑）", "段落2（具体内容和分析）", "段落3（相关股票和结论）"],\n'
+        '      "examples": ["TICKER1", "TICKER2"]\n'
+        '    }\n'
+        '  ],\n'
+        '  "closing_paragraphs": [\n'
+        '    "结尾段落1",\n'
+        '    "结尾段落2"\n'
+        '  ]\n'
+        '}\n\n'
+        "要求：\n"
+        "- intro_paragraphs：3段，总结视频的核心目标、方法和主要结论\n"
+        "- method_paragraphs：3-4段，详细说明讲者的筛选标准，必须包含视频中提到的具体数字和条件\n"
+        "- themes：列出视频讨论的所有重要主题（通常3-6个），每主题3段说明，examples填代表股票代码\n"
+        "- closing_paragraphs：1-2段，讲者的最终建议\n"
+        "- 内容必须基于实际视频内容，不要泛泛而谈\n"
+        "- 只输出JSON，不要任何额外说明"
+    )
+    import anthropic as _anthropic
+    response = _anthropic.Anthropic().messages.create(
+        model="claude-haiku-4-5-20251001",  # cheapest model
+        max_tokens=4000,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.0,
+    )
+    text = response.content[0].text  # type: ignore[union-attr]
+    json_match = re.search(r"\{.*\}", text, re.DOTALL)
+    if not json_match:
+        raise ValueError(f"Could not parse JSON from reduce response: {text[:300]}")
+    return json.loads(json_match.group())
+
+
+def generate_llm_summary(segments: list[SubtitleLike]) -> dict | None:
+    """Generate AI-powered summary using Claude API. Returns None if unavailable."""
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        return None
+    try:
+        import anthropic as _anthropic  # noqa: F401
+    except ImportError:
+        print("  [summary] anthropic package not installed; using template fallback.", flush=True)
+        return None
+
+    all_tickers = extract_tickers(merge_segment_text(segments), limit=20)
+    chunks = _chunk_transcript(segments, chunk_minutes=15.0)
+    print(f"  [summary] Summarising {len(chunks)} transcript chunks with Claude Haiku...", flush=True)
+
+    chunk_summaries: list[str] = [""] * len(chunks)
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+            futures = {
+                executor.submit(_map_chunk, None, i + 1, len(chunks), start, end, text): i
+                for i, (start, end, text) in enumerate(chunks)
+            }
+            for future in concurrent.futures.as_completed(futures):
+                idx = futures[future]
+                chunk_summaries[idx] = future.result()
+                print(f"  [summary] ✓ Chunk {idx + 1}/{len(chunks)} done", flush=True)
+
+        print("  [summary] Synthesising final summary with Claude Sonnet...", flush=True)
+        result = _reduce_summary(None, chunk_summaries, all_tickers)
+        print("  [summary] ✓ LLM summary complete.", flush=True)
+        return result
+    except Exception as exc:
+        print(f"  [summary] LLM summarisation failed ({exc}); using template fallback.", flush=True)
+        return None
+
+
 def screener_rules(segments: list[SubtitleLike]) -> list[str]:
     text = merge_segment_text(segments[:220])
     rules: list[str] = []
@@ -467,10 +615,18 @@ def closing_lines() -> list[str]:
     ]
 
 
-def build_summary_blocks(segments: list[SubtitleLike], theme_sections: list[ThemeSection]) -> list[list[str]]:
+def build_summary_blocks(
+    segments: list[SubtitleLike],
+    theme_sections: list[ThemeSection],
+    llm_summary: dict | None = None,
+) -> list[list[str]]:
     blocks: list[list[str]] = []
     wrap_width = 44
 
+    if llm_summary:
+        return _build_llm_blocks(llm_summary, wrap_width)
+
+    # --- Template fallback ---
     overview_block = ["核心结论", ""]
     for paragraph in build_intro_paragraphs(segments):
         overview_block.extend(wrap_cjk_text(paragraph, wrap_width))
@@ -504,11 +660,62 @@ def build_summary_blocks(segments: list[SubtitleLike], theme_sections: list[Them
     return blocks
 
 
+def _build_llm_blocks(llm_summary: dict, wrap_width: int) -> list[list[str]]:
+    """Build page blocks from LLM-generated summary dict."""
+    blocks: list[list[str]] = []
+
+    def _block(heading: str, paragraphs: list[str]) -> list[str]:
+        block = [heading, ""]
+        for para in paragraphs:
+            if para.strip():
+                block.extend(wrap_cjk_text(para, wrap_width))
+                block.append("")
+        return block[:-1] if block and block[-1] == "" else block
+
+    overview_paras = llm_summary.get("intro_paragraphs") or []
+    if overview_paras:
+        blocks.append(_block("核心结论", overview_paras))
+
+    method_paras = llm_summary.get("method_paragraphs") or []
+    if method_paras:
+        blocks.append(_block("筛选框架", method_paras))
+
+    themes = llm_summary.get("themes") or []
+    if themes:
+        theme_count = len(themes)
+        theme_label = "五个主题" if theme_count == 5 else f"{theme_count}个主题"
+        intro_text = f"以下{theme_label}，是讲者把筛选结果归纳后认为最值得跟踪的方向。"
+        theme_intro = [theme_label, ""]
+        theme_intro.extend(wrap_cjk_text(intro_text, wrap_width))
+        blocks.append(theme_intro)
+        for index, theme in enumerate(themes, start=1):
+            title = simplify_summary_text(theme.get("title") or "主题")
+            paras = list(theme.get("paragraphs") or [])
+            examples = theme.get("examples") or []
+            if examples:
+                ticker_str = "、".join(examples[:5])
+                if paras:
+                    paras[-1] = paras[-1].rstrip("。") + f"。相关股票包括 {ticker_str}。"
+                else:
+                    paras.append(f"相关股票包括 {ticker_str}。")
+            blocks.append(_block(f"{index}. {title}", paras))
+
+    closing_paras = llm_summary.get("closing_paragraphs") or []
+    if closing_paras:
+        blocks.append(_block("最后的用法", closing_paras))
+    elif not blocks:
+        blocks.append(["未能生成摘要。"])
+
+    return blocks
+
+
 def line_style(line: str) -> str:
     simplified = simplify_summary_text(line).strip()
     if not simplified:
         return "Spacer"
     if simplified in {"核心结论", "筛选框架", "五个主题", "核心主题", "最后的用法"}:
+        return "Heading"
+    if re.match(r"^\d+个主题$", simplified):
         return "Heading"
     if re.match(r"^\d+\.\s", simplified):
         return "Subheading"
