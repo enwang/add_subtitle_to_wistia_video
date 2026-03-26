@@ -15,6 +15,16 @@ from urllib.parse import parse_qs, urlencode, urlparse
 from faster_whisper import WhisperModel
 from summary_pdf import build_summary_pdf
 
+# Load .env from the same directory as this script
+_env_path = Path(__file__).parent / ".env"
+if _env_path.exists():
+    for _line in _env_path.read_text().splitlines():
+        _line = _line.strip()
+        if _line and not _line.startswith("#") and "=" in _line:
+            _k, _v = _line.split("=", 1)
+            if _k.strip() and _v.strip() and _k.strip() not in os.environ:
+                os.environ[_k.strip()] = _v.strip()
+
 
 @dataclass
 class SubtitleSegment:
