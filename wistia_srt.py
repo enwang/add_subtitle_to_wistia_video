@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import html
 import os
 import re
 import subprocess
@@ -9,7 +10,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlencode, urlparse
 
 from faster_whisper import WhisperModel
 from summary_pdf import build_summary_pdf
@@ -74,6 +75,9 @@ def clip_args(start: str | None, duration: str | None) -> list[str]:
 
 
 def safe_stem(url: str) -> str:
+    google_drive_id = extract_google_drive_file_id(url)
+    if google_drive_id:
+        return google_drive_id
     path = urlparse(url).path.rstrip("/")
     candidate = Path(path).name or "wistia"
     candidate = re.sub(r"\.[a-zA-Z0-9]+$", "", candidate)
@@ -91,6 +95,73 @@ def normalize_wistia_url(url: str) -> str:
         return f"https://fast.wistia.net/embed/medias/{match.group(1)}.m3u8"
 
     return url
+
+
+def extract_google_drive_file_id(url: str) -> str | None:
+    parsed = urlparse(url)
+    host = parsed.netloc.lower()
+    if host not in {"drive.google.com", "www.drive.google.com", "drive.usercontent.google.com"}:
+        return None
+
+    match = re.search(r"/file/d/([A-Za-z0-9_-]+)", parsed.path)
+    if match:
+        return match.group(1)
+
+    query = parse_qs(parsed.query)
+    values = query.get("id")
+    if values:
+        return values[0]
+    return None
+
+
+def parse_hidden_inputs(html_body: str) -> dict[str, str]:
+    fields: dict[str, str] = {}
+    for match in re.finditer(
+        r'<input[^>]+type="hidden"[^>]+name="([^"]+)"[^>]+value="([^"]*)"',
+        html_body,
+        flags=re.IGNORECASE,
+    ):
+        fields[html.unescape(match.group(1))] = html.unescape(match.group(2))
+    return fields
+
+
+def resolve_google_drive_download_url(url: str) -> str | None:
+    file_id = extract_google_drive_file_id(url)
+    if not file_id:
+        return None
+
+    probe_url = f"https://drive.google.com/uc?export=download&id={file_id}"
+    response = subprocess.check_output(["curl", "-fsSL", probe_url], text=True)
+
+    form_match = re.search(r'<form[^>]+action="([^"]+/download)"', response, flags=re.IGNORECASE)
+    if form_match:
+        params = parse_hidden_inputs(response)
+        params.setdefault("id", file_id)
+        params.setdefault("export", "download")
+        return f"{html.unescape(form_match.group(1))}?{urlencode(params)}"
+
+    direct_match = re.search(
+        r'https://drive\.usercontent\.google\.com/(?:download|uc)\?[^"\']+',
+        response,
+    )
+    if direct_match:
+        return html.unescape(direct_match.group(0).replace("\\u003d", "=").replace("\\u0026", "&"))
+
+    if "Google Drive" in response:
+        return probe_url
+
+    return probe_url
+
+
+def download_google_drive_file(url: str, destination: Path) -> None:
+    resolved = resolve_google_drive_download_url(url)
+    if not resolved:
+        raise ValueError("Could not resolve Google Drive download URL.")
+    run(["curl", "-fL", resolved, "-o", str(destination)])
+
+
+def is_google_drive_url(url: str) -> bool:
+    return extract_google_drive_file_id(url) is not None
 
 
 def ffmpeg_subtitles_arg(path: Path) -> str:
@@ -238,9 +309,9 @@ def write_srt(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Download a Wistia stream, translate audio to English subtitles, and burn them into a new MP4."
+        description="Download a Wistia or Google Drive video, transcribe or translate audio, and burn subtitles into a new MP4."
     )
-    parser.add_argument("url", help="Wistia stream URL, typically an m3u8 link")
+    parser.add_argument("url", help="Wistia or Google Drive video URL")
     parser.add_argument(
         "-o",
         "--output",
@@ -321,19 +392,41 @@ def main() -> int:
 
     try:
         stage_started = time.monotonic()
-        run(
-            [
-                ffmpeg,
-                "-y",
-                "-i",
-                input_url,
-                *clip_args(args.start, args.duration),
-                "-c",
-                "copy",
-                str(source_path),
-            ]
-        )
+        if is_google_drive_url(input_url):
+            download_google_drive_file(input_url, source_path)
+        else:
+            run(
+                [
+                    ffmpeg,
+                    "-y",
+                    "-i",
+                    input_url,
+                    *clip_args(args.start, args.duration),
+                    "-c",
+                    "copy",
+                    str(source_path),
+                ]
+            )
         timings["download"] = time.monotonic() - stage_started
+
+        if is_google_drive_url(input_url) and (args.start or args.duration):
+            clipped_source_path = source_path.with_name(f"{source_path.stem}.clip.mp4")
+            stage_started = time.monotonic()
+            run(
+                [
+                    ffmpeg,
+                    "-y",
+                    "-i",
+                    str(source_path),
+                    *clip_args(args.start, args.duration),
+                    "-c",
+                    "copy",
+                    str(clipped_source_path),
+                ]
+            )
+            source_path.unlink(missing_ok=True)
+            clipped_source_path.replace(source_path)
+            timings["download"] += time.monotonic() - stage_started
 
         stage_started = time.monotonic()
         run(
