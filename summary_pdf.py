@@ -440,125 +440,126 @@ def _map_chunk(client: object, chunk_index: int, total_chunks: int, start: float
     return response.content[0].text  # type: ignore[union-attr]
 
 
-def _reduce_summary(client: object, chunk_summaries: list[str], all_tickers: list[str], total_duration_seconds: float = 0) -> dict:
-    """Synthesize chunk summaries into a structured final summary (reduce phase).
-    Uses tool use to guarantee schema-valid JSON output."""
-    summaries_text = "\n\n".join(f"【第{i + 1}段总结】\n{s}" for i, s in enumerate(chunk_summaries))
-    tickers_str = "、".join(all_tickers[:20]) if all_tickers else "（未检测到）"
+def _duration_str(total_duration_seconds: float, chunk_count: int) -> str:
     if total_duration_seconds >= 3600:
-        duration_str = f"约{total_duration_seconds / 3600:.1f}小时"
-    elif total_duration_seconds >= 60:
-        duration_str = f"约{int(total_duration_seconds / 60)}分钟"
-    else:
-        duration_str = f"{len(chunk_summaries)}段"
+        return f"约{total_duration_seconds / 3600:.1f}小时"
+    if total_duration_seconds >= 60:
+        return f"约{int(total_duration_seconds / 60)}分钟"
+    return f"{chunk_count}段"
 
+
+def _call_tool(prompt: str, tool: dict, max_tokens: int = 6000) -> dict:
+    """Call Claude with a single tool and return the tool input dict."""
+    import anthropic as _anthropic
+    response = _anthropic.Anthropic().messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=max_tokens,
+        tools=[tool],
+        tool_choice={"type": "tool", "name": tool["name"]},
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.0,
+    )
+    for block in response.content:
+        if block.type == "tool_use" and block.name == tool["name"]:  # type: ignore[union-attr]
+            return block.input  # type: ignore[union-attr]
+    raise ValueError(f"No {tool['name']} tool_use block found in response")
+
+
+def _reduce_overview(summaries_text: str, tickers_str: str, duration_str: str) -> dict:
+    """Reduce call 1: overview, methodology, data points, meta fields."""
     prompt = (
-        f"以下是一个{duration_str}粤语财经视频的分段总结，请整合成完整详细的视频摘要，调用 write_summary 工具输出。\n\n"
+        f"以下是一个{duration_str}粤语财经视频的分段总结。请调用 write_overview 工具输出分析和摘要部分。\n\n"
         f"视频中提到的股票代码：{tickers_str}\n\n"
         f"分段总结：\n{summaries_text}\n\n"
-        "输出要求（所有文字用简体中文，内容必须具体，基于实际视频内容，不要泛泛而谈）：\n"
-        "- intro_paragraphs：3段，总结视频核心目标、主要发现和实用价值，每段3句以上\n"
-        "- method_paragraphs：4-5段，详细说明筛选标准，必须包含视频中的具体数字和条件，每段3句以上\n"
-        "- themes：列出所有重要主题（通常3-6个），每个主题写4段详细说明，examples填代表股票代码（仅大写英文字母）\n"
-        "- stock_analyses：对视频中讨论的每支重要股票，写一段分析（包括股票代码、公司名、讲者的观点和逻辑）\n"
-        "- key_data_points：列出视频中提到的所有具体数据，如涨跌幅、百分比、筛选条件数值等（每条15字左右）\n"
-        "- market_insights：列出10-15条视频中最有价值的市场洞察，每条约20字\n"
-        "- keywords：15-25个关键词，包括股票代码、板块名称、核心概念（每项1-4个字）\n"
+        "输出要求（所有文字用简体中文，内容必须具体，基于实际视频内容）：\n"
         "- one_line_takeaway：一句话（20字以内）总结视频最核心的信息\n"
-        "- closing_paragraphs：2-3段，讲者的最终建议和注意事项"
+        "- intro_paragraphs：3段，每段4句以上，总结视频核心目标、主要发现和实用价值\n"
+        "- method_paragraphs：5段，每段4句以上，详细说明筛选标准，必须包含视频中的具体数字和条件\n"
+        "- key_data_points：列出视频中提到的所有具体数据（涨跌幅、百分比、筛选条件数值等），至少15条\n"
+        "- keywords：20-25个关键词，包括股票代码、板块名称、核心概念\n"
+        "- closing_paragraphs：3段，每段3句以上，讲者的最终建议和注意事项"
     )
-
-    _SUMMARY_TOOL = {
-        "name": "write_summary",
-        "description": "Output the comprehensive structured video summary",
+    tool = {
+        "name": "write_overview",
+        "description": "Output overview, methodology and meta sections",
         "input_schema": {
             "type": "object",
             "properties": {
-                "intro_paragraphs": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "3 detailed paragraphs summarising key conclusions",
-                },
-                "method_paragraphs": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "4-5 paragraphs on screening methodology with specific numbers",
-                },
+                "one_line_takeaway": {"type": "string"},
+                "intro_paragraphs": {"type": "array", "items": {"type": "string"}},
+                "method_paragraphs": {"type": "array", "items": {"type": "string"}},
+                "key_data_points": {"type": "array", "items": {"type": "string"}},
+                "keywords": {"type": "array", "items": {"type": "string"}},
+                "closing_paragraphs": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["one_line_takeaway", "intro_paragraphs", "method_paragraphs", "key_data_points", "keywords", "closing_paragraphs"],
+        },
+    }
+    return _call_tool(prompt, tool, max_tokens=6000)
+
+
+def _reduce_themes(summaries_text: str, tickers_str: str, duration_str: str) -> dict:
+    """Reduce call 2: themes, per-stock analysis, market insights."""
+    prompt = (
+        f"以下是一个{duration_str}粤语财经视频的分段总结。请调用 write_themes 工具输出主题分析部分。\n\n"
+        f"视频中提到的股票代码：{tickers_str}\n\n"
+        f"分段总结：\n{summaries_text}\n\n"
+        "输出要求（所有文字用简体中文，内容必须具体，基于实际视频内容，不要泛泛而谈）：\n"
+        "- themes：列出所有重要主题（通常4-6个），每个主题写5段详细说明（每段4句以上），examples填该主题代表股票代码\n"
+        "- stock_analyses：对视频中每支重要股票写一段分析（股票代码+公司名+讲者观点+逻辑），至少8支股票\n"
+        "- market_insights：列出15条视频中最有价值的市场洞察，每条25字左右"
+    )
+    tool = {
+        "name": "write_themes",
+        "description": "Output theme analyses, per-stock analyses, and market insights",
+        "input_schema": {
+            "type": "object",
+            "properties": {
                 "themes": {
                     "type": "array",
-                    "description": "All major themes discussed in the video (3-6 themes)",
                     "items": {
                         "type": "object",
                         "properties": {
-                            "title": {"type": "string", "description": "Short theme title in Chinese"},
-                            "paragraphs": {
-                                "type": "array",
-                                "items": {"type": "string"},
-                                "description": "4 detailed paragraphs about this theme",
-                            },
-                            "examples": {
-                                "type": "array",
-                                "items": {"type": "string"},
-                                "description": "Stock ticker symbols (uppercase only) for this theme",
-                            },
+                            "title": {"type": "string"},
+                            "paragraphs": {"type": "array", "items": {"type": "string"}},
+                            "examples": {"type": "array", "items": {"type": "string"}},
                         },
                         "required": ["title", "paragraphs", "examples"],
                     },
                 },
                 "stock_analyses": {
                     "type": "array",
-                    "description": "One analysis paragraph per major stock discussed",
                     "items": {
                         "type": "object",
                         "properties": {
-                            "ticker": {"type": "string", "description": "Stock ticker symbol"},
-                            "analysis": {"type": "string", "description": "1-2 sentence analysis of why the speaker highlighted this stock"},
+                            "ticker": {"type": "string"},
+                            "analysis": {"type": "string"},
                         },
                         "required": ["ticker", "analysis"],
                     },
                 },
-                "key_data_points": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "10-20 specific data points mentioned: percentages, conditions, price levels (each ~15 chars)",
-                },
-                "market_insights": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "10-15 key market insights from the video (each ~20 chars)",
-                },
-                        "keywords": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "15-25 keywords: stock tickers, sector names, key concepts mentioned (each 1-4 words)",
-                },
-                "one_line_takeaway": {
-                    "type": "string",
-                    "description": "Single sentence (≤20 words in Chinese) capturing the most important message of the video",
-                },
-                "closing_paragraphs": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "2-3 closing paragraphs with final advice",
-                },
+                "market_insights": {"type": "array", "items": {"type": "string"}},
             },
-            "required": ["intro_paragraphs", "method_paragraphs", "themes", "stock_analyses", "key_data_points", "market_insights", "keywords", "one_line_takeaway", "closing_paragraphs"],
+            "required": ["themes", "stock_analyses", "market_insights"],
         },
     }
+    return _call_tool(prompt, tool, max_tokens=6000)
 
-    import anthropic as _anthropic
-    response = _anthropic.Anthropic().messages.create(
-        model="claude-haiku-4-5-20251001",  # cheapest model
-        max_tokens=6000,
-        tools=[_SUMMARY_TOOL],
-        tool_choice={"type": "tool", "name": "write_summary"},  # force tool call → guaranteed valid JSON
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.0,
-    )
-    for block in response.content:
-        if block.type == "tool_use" and block.name == "write_summary":  # type: ignore[union-attr]
-            return block.input  # type: ignore[union-attr]
-    raise ValueError("No write_summary tool_use block found in response")
+
+def _reduce_summary(client: object, chunk_summaries: list[str], all_tickers: list[str], total_duration_seconds: float = 0) -> dict:
+    """Synthesize chunk summaries into a structured final summary.
+    Uses two parallel tool-use calls to maximise output depth."""
+    summaries_text = "\n\n".join(f"【第{i + 1}段总结】\n{s}" for i, s in enumerate(chunk_summaries))
+    tickers_str = "、".join(all_tickers[:20]) if all_tickers else "（未检测到）"
+    dur = _duration_str(total_duration_seconds, len(chunk_summaries))
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        f_overview = executor.submit(_reduce_overview, summaries_text, tickers_str, dur)
+        f_themes = executor.submit(_reduce_themes, summaries_text, tickers_str, dur)
+        overview = f_overview.result()
+        themes_data = f_themes.result()
+
+    return {**overview, **themes_data}
 
 
 def generate_llm_summary(segments: list[SubtitleLike]) -> dict | None:
