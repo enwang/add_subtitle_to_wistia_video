@@ -440,58 +440,125 @@ def _map_chunk(client: object, chunk_index: int, total_chunks: int, start: float
     return response.content[0].text  # type: ignore[union-attr]
 
 
-def _reduce_summary(client: object, chunk_summaries: list[str], all_tickers: list[str]) -> dict:
-    """Synthesize chunk summaries into a structured final summary (reduce phase)."""
+def _reduce_summary(client: object, chunk_summaries: list[str], all_tickers: list[str], total_duration_seconds: float = 0) -> dict:
+    """Synthesize chunk summaries into a structured final summary (reduce phase).
+    Uses tool use to guarantee schema-valid JSON output."""
     summaries_text = "\n\n".join(f"【第{i + 1}段总结】\n{s}" for i, s in enumerate(chunk_summaries))
     tickers_str = "、".join(all_tickers[:20]) if all_tickers else "（未检测到）"
+    if total_duration_seconds >= 3600:
+        duration_str = f"约{total_duration_seconds / 3600:.1f}小时"
+    elif total_duration_seconds >= 60:
+        duration_str = f"约{int(total_duration_seconds / 60)}分钟"
+    else:
+        duration_str = f"{len(chunk_summaries)}段"
+
     prompt = (
-        "以下是一个约2小时粤语财经视频的分段总结，请整合成一份完整的视频摘要。\n\n"
+        f"以下是一个{duration_str}粤语财经视频的分段总结，请整合成完整详细的视频摘要，调用 write_summary 工具输出。\n\n"
         f"视频中提到的股票代码：{tickers_str}\n\n"
         f"分段总结：\n{summaries_text}\n\n"
-        "请严格输出以下JSON格式（所有内容用简体中文，每个段落至少2-3句话，内容要具体）：\n\n"
-        '{\n'
-        '  "intro_paragraphs": [\n'
-        '    "核心结论段落1（总结视频目标和主要发现）",\n'
-        '    "核心结论段落2（讲者强调的重点方法或发现）",\n'
-        '    "核心结论段落3（视频的实用价值和应用方式）"\n'
-        '  ],\n'
-        '  "method_paragraphs": [\n'
-        '    "筛选方法段落1（具体筛选条件和数据指标）",\n'
-        '    "筛选方法段落2（如何应用这些条件）",\n'
-        '    "筛选方法段落3（筛选结果的分析步骤）"\n'
-        '  ],\n'
-        '  "themes": [\n'
-        '    {\n'
-        '      "title": "主题名称",\n'
-        '      "paragraphs": ["段落1（背景和逻辑）", "段落2（具体内容和分析）", "段落3（相关股票和结论）"],\n'
-        '      "examples": ["TICKER1", "TICKER2"]\n'
-        '    }\n'
-        '  ],\n'
-        '  "closing_paragraphs": [\n'
-        '    "结尾段落1",\n'
-        '    "结尾段落2"\n'
-        '  ]\n'
-        '}\n\n'
-        "要求：\n"
-        "- intro_paragraphs：3段，总结视频的核心目标、方法和主要结论\n"
-        "- method_paragraphs：3-4段，详细说明讲者的筛选标准，必须包含视频中提到的具体数字和条件\n"
-        "- themes：列出视频讨论的所有重要主题（通常3-6个），每主题3段说明，examples填代表股票代码\n"
-        "- closing_paragraphs：1-2段，讲者的最终建议\n"
-        "- 内容必须基于实际视频内容，不要泛泛而谈\n"
-        "- 只输出JSON，不要任何额外说明"
+        "输出要求（所有文字用简体中文，内容必须具体，基于实际视频内容，不要泛泛而谈）：\n"
+        "- intro_paragraphs：3段，总结视频核心目标、主要发现和实用价值，每段3句以上\n"
+        "- method_paragraphs：4-5段，详细说明筛选标准，必须包含视频中的具体数字和条件，每段3句以上\n"
+        "- themes：列出所有重要主题（通常3-6个），每个主题写4段详细说明，examples填代表股票代码（仅大写英文字母）\n"
+        "- stock_analyses：对视频中讨论的每支重要股票，写一段分析（包括股票代码、公司名、讲者的观点和逻辑）\n"
+        "- key_data_points：列出视频中提到的所有具体数据，如涨跌幅、百分比、筛选条件数值等（每条15字左右）\n"
+        "- market_insights：列出10-15条视频中最有价值的市场洞察，每条约20字\n"
+        "- keywords：15-25个关键词，包括股票代码、板块名称、核心概念（每项1-4个字）\n"
+        "- one_line_takeaway：一句话（20字以内）总结视频最核心的信息\n"
+        "- closing_paragraphs：2-3段，讲者的最终建议和注意事项"
     )
+
+    _SUMMARY_TOOL = {
+        "name": "write_summary",
+        "description": "Output the comprehensive structured video summary",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "intro_paragraphs": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "3 detailed paragraphs summarising key conclusions",
+                },
+                "method_paragraphs": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "4-5 paragraphs on screening methodology with specific numbers",
+                },
+                "themes": {
+                    "type": "array",
+                    "description": "All major themes discussed in the video (3-6 themes)",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "title": {"type": "string", "description": "Short theme title in Chinese"},
+                            "paragraphs": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "4 detailed paragraphs about this theme",
+                            },
+                            "examples": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "Stock ticker symbols (uppercase only) for this theme",
+                            },
+                        },
+                        "required": ["title", "paragraphs", "examples"],
+                    },
+                },
+                "stock_analyses": {
+                    "type": "array",
+                    "description": "One analysis paragraph per major stock discussed",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "ticker": {"type": "string", "description": "Stock ticker symbol"},
+                            "analysis": {"type": "string", "description": "1-2 sentence analysis of why the speaker highlighted this stock"},
+                        },
+                        "required": ["ticker", "analysis"],
+                    },
+                },
+                "key_data_points": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "10-20 specific data points mentioned: percentages, conditions, price levels (each ~15 chars)",
+                },
+                "market_insights": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "10-15 key market insights from the video (each ~20 chars)",
+                },
+                        "keywords": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "15-25 keywords: stock tickers, sector names, key concepts mentioned (each 1-4 words)",
+                },
+                "one_line_takeaway": {
+                    "type": "string",
+                    "description": "Single sentence (≤20 words in Chinese) capturing the most important message of the video",
+                },
+                "closing_paragraphs": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "2-3 closing paragraphs with final advice",
+                },
+            },
+            "required": ["intro_paragraphs", "method_paragraphs", "themes", "stock_analyses", "key_data_points", "market_insights", "keywords", "one_line_takeaway", "closing_paragraphs"],
+        },
+    }
+
     import anthropic as _anthropic
     response = _anthropic.Anthropic().messages.create(
         model="claude-haiku-4-5-20251001",  # cheapest model
-        max_tokens=4000,
+        max_tokens=6000,
+        tools=[_SUMMARY_TOOL],
+        tool_choice={"type": "tool", "name": "write_summary"},  # force tool call → guaranteed valid JSON
         messages=[{"role": "user", "content": prompt}],
         temperature=0.0,
     )
-    text = response.content[0].text  # type: ignore[union-attr]
-    json_match = re.search(r"\{.*\}", text, re.DOTALL)
-    if not json_match:
-        raise ValueError(f"Could not parse JSON from reduce response: {text[:300]}")
-    return json.loads(json_match.group())
+    for block in response.content:
+        if block.type == "tool_use" and block.name == "write_summary":  # type: ignore[union-attr]
+            return block.input  # type: ignore[union-attr]
+    raise ValueError("No write_summary tool_use block found in response")
 
 
 def generate_llm_summary(segments: list[SubtitleLike]) -> dict | None:
@@ -506,6 +573,7 @@ def generate_llm_summary(segments: list[SubtitleLike]) -> dict | None:
 
     all_tickers = extract_tickers(merge_segment_text(segments), limit=20)
     chunks = _chunk_transcript(segments, chunk_minutes=15.0)
+    total_duration = segments[-1].end if segments else 0
     print(f"  [summary] Summarising {len(chunks)} transcript chunks with Claude Haiku...", flush=True)
 
     chunk_summaries: list[str] = [""] * len(chunks)
@@ -520,8 +588,8 @@ def generate_llm_summary(segments: list[SubtitleLike]) -> dict | None:
                 chunk_summaries[idx] = future.result()
                 print(f"  [summary] ✓ Chunk {idx + 1}/{len(chunks)} done", flush=True)
 
-        print("  [summary] Synthesising final summary with Claude Sonnet...", flush=True)
-        result = _reduce_summary(None, chunk_summaries, all_tickers)
+        print("  [summary] Synthesising final summary with Claude Haiku...", flush=True)
+        result = _reduce_summary(None, chunk_summaries, all_tickers, total_duration_seconds=total_duration)
         print("  [summary] ✓ LLM summary complete.", flush=True)
         return result
     except Exception as exc:
@@ -672,6 +740,19 @@ def _build_llm_blocks(llm_summary: dict, wrap_width: int) -> list[list[str]]:
                 block.append("")
         return block[:-1] if block and block[-1] == "" else block
 
+    def _bullet_block(heading: str, items: list[str], prefix: str = "• ") -> list[str]:
+        block = [heading, ""]
+        for item in items:
+            if item.strip():
+                block.extend(wrap_cjk_text(f"{prefix}{item.strip()}", wrap_width))
+                block.append("")
+        return block[:-1] if block and block[-1] == "" else block
+
+    # One-line takeaway as a standalone prominent block
+    takeaway = (llm_summary.get("one_line_takeaway") or "").strip()
+    if takeaway:
+        blocks.append(["一句话总结", "", *wrap_cjk_text(takeaway, wrap_width)])
+
     overview_paras = llm_summary.get("intro_paragraphs") or []
     if overview_paras:
         blocks.append(_block("核心结论", overview_paras))
@@ -679,6 +760,11 @@ def _build_llm_blocks(llm_summary: dict, wrap_width: int) -> list[list[str]]:
     method_paras = llm_summary.get("method_paragraphs") or []
     if method_paras:
         blocks.append(_block("筛选框架", method_paras))
+
+    # Key data points — rendered as compact bullets
+    data_points = llm_summary.get("key_data_points") or []
+    if data_points:
+        blocks.append(_bullet_block("关键数据", data_points))
 
     themes = llm_summary.get("themes") or []
     if themes:
@@ -695,10 +781,35 @@ def _build_llm_blocks(llm_summary: dict, wrap_width: int) -> list[list[str]]:
             if examples:
                 ticker_str = "、".join(examples[:5])
                 if paras:
-                    paras[-1] = paras[-1].rstrip("。") + f"。相关股票包括 {ticker_str}。"
+                    paras[-1] = paras[-1].rstrip("。") + f"。相关股票：{ticker_str}。"
                 else:
-                    paras.append(f"相关股票包括 {ticker_str}。")
+                    paras.append(f"相关股票：{ticker_str}。")
             blocks.append(_block(f"{index}. {title}", paras))
+
+    # Per-stock analysis
+    stock_analyses = llm_summary.get("stock_analyses") or []
+    if stock_analyses:
+        stock_block = ["重点股票分析", ""]
+        for item in stock_analyses:
+            ticker = (item.get("ticker") or "").strip()
+            analysis = (item.get("analysis") or "").strip()
+            if ticker and analysis:
+                combined = f"[{ticker}] {analysis}"
+                stock_block.extend(wrap_cjk_text(combined, wrap_width))
+                stock_block.append("")
+        if len(stock_block) > 2:
+            blocks.append(stock_block[:-1] if stock_block[-1] == "" else stock_block)
+
+    # Market insights — bullet list
+    insights = llm_summary.get("market_insights") or []
+    if insights:
+        blocks.append(_bullet_block("市场洞察", insights))
+
+    # Keywords — comma-separated compact list
+    keywords = llm_summary.get("keywords") or []
+    if keywords:
+        kw_text = "  ".join(keywords)
+        blocks.append(["关键词", "", *wrap_cjk_text(kw_text, wrap_width)])
 
     closing_paras = llm_summary.get("closing_paragraphs") or []
     if closing_paras:
@@ -713,7 +824,7 @@ def line_style(line: str) -> str:
     simplified = simplify_summary_text(line).strip()
     if not simplified:
         return "Spacer"
-    if simplified in {"核心结论", "筛选框架", "五个主题", "核心主题", "最后的用法"}:
+    if simplified in {"核心结论", "筛选框架", "五个主题", "核心主题", "最后的用法", "关键数据", "重点股票分析", "市场洞察", "一句话总结", "关键词"}:
         return "Heading"
     if re.match(r"^\d+个主题$", simplified):
         return "Heading"
