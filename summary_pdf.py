@@ -775,11 +775,14 @@ def _build_llm_blocks(llm_summary: dict, wrap_width: int) -> list[list[str]]:
         theme_intro.extend(wrap_cjk_text(intro_text, wrap_width))
         blocks.append(theme_intro)
         for index, theme in enumerate(themes, start=1):
+            if isinstance(theme, str):
+                blocks.append(_block(f"{index}. 主题", [theme]))
+                continue
             title = simplify_summary_text(theme.get("title") or "主题")
             paras = list(theme.get("paragraphs") or [])
             examples = theme.get("examples") or []
             if examples:
-                ticker_str = "、".join(examples[:5])
+                ticker_str = "、".join(str(e) for e in examples[:5])
                 if paras:
                     paras[-1] = paras[-1].rstrip("。") + f"。相关股票：{ticker_str}。"
                 else:
@@ -791,6 +794,10 @@ def _build_llm_blocks(llm_summary: dict, wrap_width: int) -> list[list[str]]:
     if stock_analyses:
         stock_block = ["重点股票分析", ""]
         for item in stock_analyses:
+            if isinstance(item, str):
+                stock_block.extend(wrap_cjk_text(item, wrap_width))
+                stock_block.append("")
+                continue
             ticker = (item.get("ticker") or "").strip()
             analysis = (item.get("analysis") or "").strip()
             if ticker and analysis:

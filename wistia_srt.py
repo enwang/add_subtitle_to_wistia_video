@@ -15,6 +15,12 @@ from urllib.parse import parse_qs, urlencode, urlparse
 from faster_whisper import WhisperModel
 from summary_pdf import build_summary_pdf
 
+try:
+    import mlx_whisper as _mlx_whisper
+    _MLX_AVAILABLE = True
+except ImportError:
+    _MLX_AVAILABLE = False
+
 # Load .env from the same directory as this script
 _env_path = Path(__file__).parent / ".env"
 if _env_path.exists():
@@ -239,7 +245,68 @@ def wrap_text_block(text: str, width: int) -> list[str]:
     return lines
 
 
+_MLX_MODEL_MAP = {
+    "large-v3": "mlx-community/whisper-large-v3-mlx",
+    "large-v2": "mlx-community/whisper-large-v2-mlx",
+    "medium": "mlx-community/whisper-medium-mlx",
+    "small": "mlx-community/whisper-small-mlx",
+    "base": "mlx-community/whisper-base-mlx",
+    "tiny": "mlx-community/whisper-tiny-mlx",
+}
+
+
 def write_srt(
+    audio_path: Path,
+    srt_path: Path,
+    model_name: str,
+    device: str,
+    compute_type: str,
+    task: str,
+    language: str | None,
+) -> tuple[int, dict[str, float], list[SubtitleSegment], str | None]:
+    mlx_repo = _MLX_MODEL_MAP.get(model_name) if _MLX_AVAILABLE and device in ("auto", "cpu") else None
+    if mlx_repo:
+        return _write_srt_mlx(audio_path, srt_path, mlx_repo, task, language)
+    return _write_srt_faster_whisper(audio_path, srt_path, model_name, device, compute_type, task, language)
+
+
+def _write_srt_mlx(
+    audio_path: Path,
+    srt_path: Path,
+    mlx_repo: str,
+    task: str,
+    language: str | None,
+) -> tuple[int, dict[str, float], list[SubtitleSegment], str | None]:
+    print(f"Using mlx-whisper ({mlx_repo}) on Apple Silicon GPU", flush=True)
+    load_started = time.monotonic()
+    transcribe_kwargs: dict = {"path_or_hf_repo": mlx_repo, "task": task, "verbose": False}
+    if language:
+        transcribe_kwargs["language"] = language
+    load_elapsed = time.monotonic() - load_started
+    duration = media_duration_seconds(audio_path)
+    print(f"Transcribing audio with mlx-whisper...", flush=True)
+    transcribe_started = time.monotonic()
+    result = _mlx_whisper.transcribe(str(audio_path), **transcribe_kwargs)
+    transcribe_elapsed = time.monotonic() - transcribe_started
+    detected_language = result.get("language")
+    print(f"Detected language: {detected_language}", flush=True)
+    raw_segments = result.get("segments") or []
+    subtitle_segments: list[SubtitleSegment] = []
+    written = 0
+    with srt_path.open("w", encoding="utf-8") as handle:
+        for seg in raw_segments:
+            text = (seg.get("text") or "").strip()
+            if not text:
+                continue
+            written += 1
+            subtitle_segments.append(SubtitleSegment(start=seg["start"], end=seg["end"], text=text))
+            handle.write(f"{written}\n{timestamp(seg['start'])} --> {timestamp(seg['end'])}\n{text}\n\n")
+    if duration:
+        print(f"Transcribing audio: 100% ({clock_timestamp(duration)}/{clock_timestamp(duration)}), elapsed {clock_timestamp(transcribe_elapsed)}", flush=True)
+    return written, {"model_load": load_elapsed, "transcribe": transcribe_elapsed}, subtitle_segments, detected_language
+
+
+def _write_srt_faster_whisper(
     audio_path: Path,
     srt_path: Path,
     model_name: str,
