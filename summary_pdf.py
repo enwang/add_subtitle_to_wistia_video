@@ -473,11 +473,11 @@ def _reduce_overview(summaries_text: str, tickers_str: str, duration_str: str) -
         f"分段总结：\n{summaries_text}\n\n"
         "输出要求（所有文字用简体中文，内容必须具体，基于实际视频内容）：\n"
         "- one_line_takeaway：一句话（20字以内）总结视频最核心的信息\n"
-        "- intro_paragraphs：3段，每段4句以上，总结视频核心目标、主要发现和实用价值\n"
-        "- method_paragraphs：5段，每段4句以上，详细说明筛选标准，必须包含视频中的具体数字和条件\n"
-        "- key_data_points：列出视频中提到的所有具体数据（涨跌幅、百分比、筛选条件数值等），至少15条\n"
-        "- keywords：20-25个关键词，包括股票代码、板块名称、核心概念\n"
-        "- closing_paragraphs：3段，每段3句以上，讲者的最终建议和注意事项"
+        "- intro_paragraphs：恰好3段，每段2-3句，每段不超过80字，总结视频核心目标、主要发现和实用价值\n"
+        "- method_paragraphs：恰好5段，每段2-3句，每段不超过80字，说明筛选标准，必须包含具体数字和条件\n"
+        "- key_data_points：视频中提到的具体数据（涨跌幅、百分比、条件数值等），最多20条，每条不超过40字\n"
+        "- keywords：最多20个关键词，包括股票代码、板块名称、核心概念\n"
+        "- closing_paragraphs：恰好3段，每段2-3句，每段不超过80字，讲者的最终建议和注意事项"
     )
     tool = {
         "name": "write_overview",
@@ -488,8 +488,8 @@ def _reduce_overview(summaries_text: str, tickers_str: str, duration_str: str) -
                 "one_line_takeaway": {"type": "string"},
                 "intro_paragraphs": {"type": "array", "items": {"type": "string"}},
                 "method_paragraphs": {"type": "array", "items": {"type": "string"}},
-                "key_data_points": {"type": "array", "items": {"type": "string"}},
-                "keywords": {"type": "array", "items": {"type": "string"}},
+                "key_data_points": {"type": "array", "maxItems": 20, "items": {"type": "string"}},
+                "keywords": {"type": "array", "maxItems": 25, "items": {"type": "string"}},
                 "closing_paragraphs": {"type": "array", "items": {"type": "string"}},
             },
             "required": ["one_line_takeaway", "intro_paragraphs", "method_paragraphs", "key_data_points", "keywords", "closing_paragraphs"],
@@ -505,9 +505,9 @@ def _reduce_themes(summaries_text: str, tickers_str: str, duration_str: str) -> 
         f"视频中提到的股票代码：{tickers_str}\n\n"
         f"分段总结：\n{summaries_text}\n\n"
         "输出要求（所有文字用简体中文，内容必须具体，基于实际视频内容，不要泛泛而谈）：\n"
-        "- themes：列出所有重要主题（通常4-6个），每个主题写5段详细说明（每段4句以上），examples填该主题代表股票代码\n"
-        "- stock_analyses：对视频中每支重要股票写一段分析（股票代码+公司名+讲者观点+逻辑），至少8支股票\n"
-        "- market_insights：列出15条视频中最有价值的市场洞察，每条25字左右"
+        "- themes：列出4-6个重要主题，每个主题写3段说明（每段2-3句不超过80字），examples填该主题代表股票代码\n"
+        "- stock_analyses：选出最重要的8-12支股票，每支写一段分析（股票代码+公司名+讲者观点，不超过80字），最多12支\n"
+        "- market_insights：最多15条市场洞察，每条不超过40字"
     )
     tool = {
         "name": "write_themes",
@@ -517,18 +517,20 @@ def _reduce_themes(summaries_text: str, tickers_str: str, duration_str: str) -> 
             "properties": {
                 "themes": {
                     "type": "array",
+                    "maxItems": 6,
                     "items": {
                         "type": "object",
                         "properties": {
                             "title": {"type": "string"},
-                            "paragraphs": {"type": "array", "items": {"type": "string"}},
-                            "examples": {"type": "array", "items": {"type": "string"}},
+                            "paragraphs": {"type": "array", "maxItems": 5, "items": {"type": "string"}},
+                            "examples": {"type": "array", "maxItems": 6, "items": {"type": "string"}},
                         },
                         "required": ["title", "paragraphs", "examples"],
                     },
                 },
                 "stock_analyses": {
                     "type": "array",
+                    "maxItems": 12,
                     "items": {
                         "type": "object",
                         "properties": {
@@ -538,12 +540,12 @@ def _reduce_themes(summaries_text: str, tickers_str: str, duration_str: str) -> 
                         "required": ["ticker", "analysis"],
                     },
                 },
-                "market_insights": {"type": "array", "items": {"type": "string"}},
+                "market_insights": {"type": "array", "maxItems": 15, "items": {"type": "string"}},
             },
             "required": ["themes", "stock_analyses", "market_insights"],
         },
     }
-    return _call_tool(prompt, tool, max_tokens=6000)
+    return _call_tool(prompt, tool, max_tokens=8000)
 
 
 def _reduce_summary(client: object, chunk_summaries: list[str], all_tickers: list[str], total_duration_seconds: float = 0) -> dict:
@@ -729,99 +731,145 @@ def build_summary_blocks(
     return blocks
 
 
+def _coerce_list(val: object) -> list:
+    """Return val as a list. Handles LLM returning a JSON-encoded string instead of an array."""
+    if isinstance(val, list):
+        return val
+    if isinstance(val, str):
+        s = val.strip()
+        if s.startswith("["):
+            try:
+                parsed = json.loads(s)
+                if isinstance(parsed, list):
+                    return parsed
+            except (json.JSONDecodeError, ValueError):
+                pass
+        return [s] if s else []
+    return []
+
+
 def _build_llm_blocks(llm_summary: dict, wrap_width: int) -> list[list[str]]:
-    """Build page blocks from LLM-generated summary dict."""
+    """Build page blocks from LLM-generated summary dict.
+
+    All lists are sliced in code regardless of LLM output length.
+    Each paragraph is hard-capped at MAX_PARA_LINES to prevent page overflow.
+    """
     blocks: list[list[str]] = []
+    MAX_PARA_LINES = 6  # each paragraph renders at most this many lines
 
-    def _block(heading: str, paragraphs: list[str]) -> list[str]:
+    def _para_lines(text: str) -> list[str]:
+        """Wrap text and cap to MAX_PARA_LINES, appending … if truncated."""
+        lines = wrap_cjk_text(text.strip(), wrap_width)
+        if len(lines) > MAX_PARA_LINES:
+            lines = lines[:MAX_PARA_LINES]
+            lines[-1] = lines[-1][: wrap_width - 1] + "…"
+        return lines
+
+    def _block(heading: str, paragraphs: list[str], max_paras: int = 5) -> list[str]:
+        """Heading + body paragraphs, each capped at MAX_PARA_LINES lines."""
         block = [heading, ""]
-        for para in paragraphs:
-            if para.strip():
-                block.extend(wrap_cjk_text(para, wrap_width))
+        for para in paragraphs[:max_paras]:
+            para = para.strip()
+            if para:
+                block.extend(_para_lines(para))
                 block.append("")
         return block[:-1] if block and block[-1] == "" else block
 
-    def _bullet_block(heading: str, items: list[str], prefix: str = "• ") -> list[str]:
+    def _bullet_block(heading: str, items: list[str], max_items: int = 20) -> list[str]:
+        """Heading + single-line bullet items (▸ prefix, no wrapping)."""
         block = [heading, ""]
-        for item in items:
-            if item.strip():
-                block.extend(wrap_cjk_text(f"{prefix}{item.strip()}", wrap_width))
-                block.append("")
-        return block[:-1] if block and block[-1] == "" else block
+        for item in items[:max_items]:
+            item = item.strip()
+            if not item:
+                continue
+            if len(item) > wrap_width - 3:
+                item = item[: wrap_width - 4] + "…"
+            block.append(f"▸ {item}")
+        return block
 
-    # One-line takeaway as a standalone prominent block
+    # ── One-line takeaway ───────────────────────────────────────────
     takeaway = (llm_summary.get("one_line_takeaway") or "").strip()
     if takeaway:
-        blocks.append(["一句话总结", "", *wrap_cjk_text(takeaway, wrap_width)])
+        blocks.append(["一句话总结", "", *wrap_cjk_text(takeaway, wrap_width)[:2]])
 
-    overview_paras = llm_summary.get("intro_paragraphs") or []
+    # ── Core conclusions (3 paras max) ──────────────────────────────
+    overview_paras = _coerce_list(llm_summary.get("intro_paragraphs"))
     if overview_paras:
-        blocks.append(_block("核心结论", overview_paras))
+        blocks.append(_block("核心结论", overview_paras, max_paras=3))
 
-    method_paras = llm_summary.get("method_paragraphs") or []
+    # ── Screening methodology (5 paras max) ─────────────────────────
+    method_paras = _coerce_list(llm_summary.get("method_paragraphs"))
     if method_paras:
-        blocks.append(_block("筛选框架", method_paras))
+        blocks.append(_block("筛选框架", method_paras, max_paras=5))
 
-    # Key data points — rendered as compact bullets
-    data_points = llm_summary.get("key_data_points") or []
+    # ── Key data points (20 bullets max) ────────────────────────────
+    data_points = _coerce_list(llm_summary.get("key_data_points"))
     if data_points:
-        blocks.append(_bullet_block("关键数据", data_points))
+        blocks.append(_bullet_block("关键数据", data_points, max_items=20))
 
-    themes = llm_summary.get("themes") or []
+    # ── Themes (6 themes max, 3 paras each) ─────────────────────────
+    themes = _coerce_list(llm_summary.get("themes"))
     if themes:
-        theme_count = len(themes)
-        theme_label = "五个主题" if theme_count == 5 else f"{theme_count}个主题"
-        intro_text = f"以下{theme_label}，是讲者把筛选结果归纳后认为最值得跟踪的方向。"
+        themes = themes[:6]
+        theme_label = "五个主题" if len(themes) == 5 else f"{len(themes)}个主题"
         theme_intro = [theme_label, ""]
-        theme_intro.extend(wrap_cjk_text(intro_text, wrap_width))
+        theme_intro.extend(wrap_cjk_text(f"以下{theme_label}是视频分析的核心方向。", wrap_width)[:2])
         blocks.append(theme_intro)
+
         for index, theme in enumerate(themes, start=1):
             if isinstance(theme, str):
                 blocks.append(_block(f"{index}. 主题", [theme]))
                 continue
-            title = simplify_summary_text(theme.get("title") or "主题")
+            title = simplify_summary_text((theme.get("title") or "主题")[:30])
             paras = list(theme.get("paragraphs") or [])
-            examples = theme.get("examples") or []
-            if examples:
-                ticker_str = "、".join(str(e) for e in examples[:5])
-                if paras:
-                    paras[-1] = paras[-1].rstrip("。") + f"。相关股票：{ticker_str}。"
-                else:
-                    paras.append(f"相关股票：{ticker_str}。")
-            blocks.append(_block(f"{index}. {title}", paras))
+            examples = [str(e).strip() for e in (theme.get("examples") or []) if str(e).strip()]
 
-    # Per-stock analysis
-    stock_analyses = llm_summary.get("stock_analyses") or []
+            theme_block = [f"{index}. {title}", ""]
+            if examples:
+                tag_line = "  ".join(f"[{t}]" for t in examples[:6])
+                theme_block.append(tag_line)
+                theme_block.append("")
+            for para in paras[:3]:  # max 3 paragraphs per theme
+                para = para.strip()
+                if para:
+                    theme_block.extend(_para_lines(para))
+                    theme_block.append("")
+            blocks.append(theme_block[:-1] if theme_block and theme_block[-1] == "" else theme_block)
+
+    # ── Per-stock analysis (12 stocks max, capped per stock) ────────
+    stock_analyses = _coerce_list(llm_summary.get("stock_analyses"))
     if stock_analyses:
-        stock_block = ["重点股票分析", ""]
-        for item in stock_analyses:
+        blocks.append(["重点股票分析", ""])
+        for item in stock_analyses[:12]:
             if isinstance(item, str):
-                stock_block.extend(wrap_cjk_text(item, wrap_width))
-                stock_block.append("")
+                blocks.append(["", *_para_lines(item)])
                 continue
             ticker = (item.get("ticker") or "").strip()
             analysis = (item.get("analysis") or "").strip()
-            if ticker and analysis:
-                combined = f"[{ticker}] {analysis}"
-                stock_block.extend(wrap_cjk_text(combined, wrap_width))
-                stock_block.append("")
-        if len(stock_block) > 2:
-            blocks.append(stock_block[:-1] if stock_block[-1] == "" else stock_block)
+            if not ticker or not analysis:
+                continue
+            stock_block: list[str] = [f"◆ {ticker}", ""]
+            stock_block.extend(_para_lines(analysis))
+            blocks.append(stock_block)
 
-    # Market insights — bullet list
-    insights = llm_summary.get("market_insights") or []
+    # ── Market insights (15 bullets max) ────────────────────────────
+    insights = _coerce_list(llm_summary.get("market_insights"))
     if insights:
-        blocks.append(_bullet_block("市场洞察", insights))
+        blocks.append(_bullet_block("市场洞察", insights, max_items=15))
 
-    # Keywords — comma-separated compact list
-    keywords = llm_summary.get("keywords") or []
+    # ── Keywords (rows of 6, max 24) ─────────────────────────────────
+    keywords = _coerce_list(llm_summary.get("keywords"))[:24]
     if keywords:
-        kw_text = "  ".join(keywords)
-        blocks.append(["关键词", "", *wrap_cjk_text(kw_text, wrap_width)])
+        kw_block = ["关键词", ""]
+        row_size = 6
+        for i in range(0, len(keywords), row_size):
+            kw_block.append("    ".join(keywords[i: i + row_size]))
+        blocks.append(kw_block)
 
-    closing_paras = llm_summary.get("closing_paragraphs") or []
+    # ── Closing (3 paras max) ─────────────────────────────────────────
+    closing_paras = _coerce_list(llm_summary.get("closing_paragraphs"))
     if closing_paras:
-        blocks.append(_block("最后的用法", closing_paras))
+        blocks.append(_block("最后的用法", closing_paras, max_paras=3))
     elif not blocks:
         blocks.append(["未能生成摘要。"])
 
