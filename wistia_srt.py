@@ -7,9 +7,11 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 from urllib.parse import parse_qs, urlencode, urlparse
 
 from faster_whisper import WhisperModel
@@ -20,6 +22,15 @@ try:
     _MLX_AVAILABLE = True
 except ImportError:
     _MLX_AVAILABLE = False
+
+try:
+    import anthropic as _anthropic
+    _ANTHROPIC_AVAILABLE = True
+except ImportError:
+    _ANTHROPIC_AVAILABLE = False
+
+# Primer sentence in simplified Chinese — biases Whisper toward simplified characters
+_SIMPLIFIED_CHINESE_PROMPT = "以下是普通话或粤语财经视频的字幕内容。"
 
 # Load .env from the same directory as this script
 _env_path = Path(__file__).parent / ".env"
@@ -227,6 +238,252 @@ def media_duration_seconds(path: Path) -> float | None:
     return duration if duration > 0 else None
 
 
+def extract_audio_clip(audio_path: Path, start: float, end: float, dest: Path) -> None:
+    ffmpeg = ffmpeg_binary()
+    if not ffmpeg:
+        raise RuntimeError("ffmpeg not found")
+    subprocess.run(
+        [
+            ffmpeg, "-y",
+            "-ss", str(start),
+            "-t", str(end - start),
+            "-i", str(audio_path),
+            "-c", "copy",
+            "-avoid_negative_ts", "make_zero",
+            str(dest),
+        ],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def fill_gaps(
+    segments: list[SubtitleSegment],
+    audio_path: Path,
+    audio_duration: float,
+    gap_threshold: float,
+    transcribe_clip: Callable[[Path], list[SubtitleSegment]],
+) -> list[SubtitleSegment]:
+    """Detect silent gaps between segments and re-transcribe them to recover skipped words."""
+    if not segments:
+        return segments
+
+    gaps: list[tuple[float, float]] = []
+
+    # Leading gap: audio before the first segment
+    if segments[0].start > gap_threshold:
+        gaps.append((0.0, segments[0].start))
+
+    # Gaps between consecutive segments
+    for i in range(len(segments) - 1):
+        gap_start = segments[i].end
+        gap_end = segments[i + 1].start
+        if gap_end - gap_start > gap_threshold:
+            gaps.append((gap_start, gap_end))
+
+    if not gaps:
+        return segments
+
+    print(f"\nGap fill: found {len(gaps)} gap(s) exceeding {gap_threshold:.1f}s — re-transcribing...", flush=True)
+    recovered: list[SubtitleSegment] = []
+
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for i, (gap_start, gap_end) in enumerate(gaps):
+                clip_path = Path(tmpdir) / f"gap_{i}.m4a"
+                print(
+                    f"  Gap {i + 1}/{len(gaps)}: {timestamp(gap_start)} → {timestamp(gap_end)} "
+                    f"({gap_end - gap_start:.1f}s)",
+                    flush=True,
+                )
+                try:
+                    extract_audio_clip(audio_path, gap_start, gap_end, clip_path)
+                    clip_segments = transcribe_clip(clip_path)
+                    if clip_segments:
+                        print(f"    Recovered {len(clip_segments)} segment(s)", flush=True)
+                        for seg in clip_segments:
+                            recovered.append(
+                                SubtitleSegment(
+                                    start=seg.start + gap_start,
+                                    end=seg.end + gap_start,
+                                    text=seg.text,
+                                )
+                            )
+                    else:
+                        print(f"    No speech found (genuine silence)", flush=True)
+                except Exception as exc:
+                    print(f"    Warning: gap re-transcription failed: {exc}", flush=True)
+    except Exception as exc:
+        print(f"Gap fill: setup failed ({exc}), continuing without gap recovery.", flush=True)
+        return segments
+
+    if not recovered:
+        return segments
+
+    merged = sorted(segments + recovered, key=lambda s: s.start)
+    print(f"Gap fill: inserted {len(recovered)} recovered segment(s).", flush=True)
+    return merged
+
+
+def _call_coherence_tool(lines: list[str], api_key: str, language: str | None) -> dict:
+    """Call Claude to flag incoherent subtitle segments. Returns tool input dict or {} on failure."""
+    if not _ANTHROPIC_AVAILABLE:
+        return {}
+    lang_hint = f" The video is in language code '{language}'." if language else ""
+    hallucination_examples = "感谢观看, 请订阅, 字幕提供, 敬请期待, 如果你觉得有用请点赞"
+    prompt = (
+        f"You are reviewing auto-generated subtitles for a Cantonese/Mandarin financial video.{lang_hint}\n"
+        "Each line is formatted as INDEX: [HH:MM:SS] subtitle_text.\n\n"
+        "Flag any segment that is LIKELY WRONG due to:\n"
+        "1. English finance terms mis-transcribed as phonetically similar Chinese characters "
+        "(e.g. 'draw down' → '阻挡', 'cut loss' → '卡罗斯', 'support level' → '撑位' when clearly English was spoken)\n"
+        "2. Known Whisper hallucination phrases such as: " + hallucination_examples + "\n"
+        "3. Text that completely breaks the logical flow of the surrounding financial discussion\n"
+        "4. Gibberish or random characters unrelated to speech\n\n"
+        "Be CONSERVATIVE: only flag segments you are CONFIDENT are wrong. "
+        "Do NOT flag segments that are merely unusual. "
+        "Mixed Chinese/English is completely normal in Cantonese financial speech.\n\n"
+        "Segments to review:\n"
+        + "\n".join(f"{i}: {line}" for i, line in enumerate(lines))
+    )
+    tool = {
+        "name": "flag_incoherent_segments",
+        "description": "Flag subtitle segments that appear incorrect or hallucinatory given surrounding context.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "flagged": {
+                    "type": "array",
+                    "description": "Segments to re-transcribe. Empty array if none.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "index": {"type": "integer", "description": "0-based index within the provided list"},
+                            "reason": {"type": "string", "description": "Brief reason this segment appears wrong"},
+                        },
+                        "required": ["index", "reason"],
+                    },
+                }
+            },
+            "required": ["flagged"],
+        },
+    }
+    client = _anthropic.Anthropic(api_key=api_key)
+    response = client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=1024,
+        tools=[tool],
+        tool_choice={"type": "tool", "name": "flag_incoherent_segments"},
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.0,
+    )
+    for block in response.content:
+        if block.type == "tool_use" and block.name == "flag_incoherent_segments":
+            return block.input
+    return {}
+
+
+def check_coherence(
+    segments: list[SubtitleSegment],
+    api_key: str,
+    language: str | None,
+) -> list[tuple[int, str]]:
+    """Slide a window over segments and ask Claude to flag incoherent ones.
+    Returns list of (global_index, reason) sorted ascending. Returns [] on any failure.
+    """
+    if not segments:
+        return []
+    try:
+        WINDOW_SIZE = 20
+        STEP = 15
+        flagged_map: dict[int, str] = {}
+
+        for window_start in range(0, len(segments), STEP):
+            window = segments[window_start: window_start + WINDOW_SIZE]
+            lines = [f"[{timestamp(seg.start)}] {seg.text}" for seg in window]
+            result = _call_coherence_tool(lines, api_key, language)
+            for item in result.get("flagged") or []:
+                local_idx = item.get("index")
+                reason = item.get("reason", "")
+                if isinstance(local_idx, int) and 0 <= local_idx < len(window):
+                    global_idx = window_start + local_idx
+                    if global_idx not in flagged_map:
+                        flagged_map[global_idx] = reason
+
+        return sorted(flagged_map.items())
+    except Exception as exc:
+        print(f"\nLLM coherence check failed ({exc}), skipping verification.", flush=True)
+        return []
+
+
+def verify_and_retry(
+    segments: list[SubtitleSegment],
+    audio_path: Path,
+    transcribe_clip: Callable[[Path], list[SubtitleSegment]],
+    api_key: str,
+    language: str | None,
+) -> list[SubtitleSegment]:
+    """Ask Claude to flag incoherent segments, then re-transcribe those audio windows."""
+    if not segments:
+        return segments
+
+    print(f"\nLLM verification: checking {len(segments)} segment(s) for coherence...", flush=True)
+    flagged = check_coherence(segments, api_key, language)
+
+    if not flagged:
+        print("LLM verification: no issues found.", flush=True)
+        return segments
+
+    print(f"LLM verification: {len(flagged)} segment(s) flagged for re-transcription.", flush=True)
+    result: list[SubtitleSegment] = list(segments)
+    offset = 0
+
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for original_idx, reason in flagged:
+                current_idx = original_idx + offset
+                if current_idx >= len(result):
+                    continue
+                seg = result[current_idx]
+                clip_path = Path(tmpdir) / f"verify_{original_idx}.m4a"
+                print(
+                    f"  Re-transcribing [{timestamp(seg.start)} → {timestamp(seg.end)}] "
+                    f"was: {seg.text!r} — reason: {reason}",
+                    flush=True,
+                )
+                try:
+                    extract_audio_clip(audio_path, seg.start, seg.end, clip_path)
+                    new_segs = transcribe_clip(clip_path)
+                except Exception as exc:
+                    print(f"    Warning: re-transcription failed ({exc}), keeping original.", flush=True)
+                    continue
+
+                if not new_segs:
+                    print(f"    No speech found in clip; keeping original.", flush=True)
+                    continue
+
+                adjusted = [
+                    SubtitleSegment(
+                        start=s.start + seg.start,
+                        end=s.end + seg.start,
+                        text=s.text,
+                    )
+                    for s in new_segs
+                ]
+                new_text = " / ".join(s.text for s in adjusted)
+                print(f"    Fixed: {seg.text!r} → {new_text!r}", flush=True)
+                result = result[:current_idx] + adjusted + result[current_idx + 1:]
+                offset += len(adjusted) - 1
+
+    except Exception as exc:
+        print(f"LLM verification: setup failed ({exc}), returning segments as-is.", flush=True)
+        return segments
+
+    print(f"LLM verification: complete. {len(segments)} → {len(result)} segment(s).", flush=True)
+    return result
+
+
 def wrap_text_block(text: str, width: int) -> list[str]:
     lines: list[str] = []
     for paragraph in text.splitlines():
@@ -255,6 +512,73 @@ _MLX_MODEL_MAP = {
 }
 
 
+def sanitize_segments(segments: list[SubtitleSegment]) -> list[SubtitleSegment]:
+    """Remove duplicate, overlapping, and near-duplicate subtitle segments and log issues."""
+    if not segments:
+        return segments
+
+    issues: list[str] = []
+    cleaned: list[SubtitleSegment] = []
+
+    for seg in segments:
+        if not cleaned:
+            cleaned.append(seg)
+            continue
+
+        prev = cleaned[-1]
+
+        # Exact consecutive duplicate text — extend the previous segment's end time
+        if seg.text == prev.text:
+            merged_end = max(prev.end, seg.end)
+            issues.append(
+                f"exact duplicate at {timestamp(seg.start)}: extended end from "
+                f"{timestamp(prev.end)} to {timestamp(merged_end)}: {seg.text!r}"
+            )
+            cleaned[-1] = SubtitleSegment(start=prev.start, end=merged_end, text=prev.text)
+            continue
+
+        # Overlapping timestamps: seg starts before prev ends
+        if seg.start < prev.end:
+            fixed_start = prev.end
+            fixed_end = max(seg.end, prev.end + 0.1)
+            issues.append(
+                f"overlap at {timestamp(seg.start)} (prev ends {timestamp(prev.end)}): "
+                f"adjusted start to {timestamp(fixed_start)}"
+            )
+            seg = SubtitleSegment(start=fixed_start, end=fixed_end, text=seg.text)
+
+        # Near-duplicate: one text fully contained in the other
+        if seg.text in prev.text:
+            issues.append(f"redundant segment (contained in previous) at {timestamp(seg.start)}: {seg.text!r}")
+            continue
+        if prev.text in seg.text:
+            issues.append(f"redundant segment (contains previous) at {timestamp(seg.start)}: replacing previous with longer text")
+            cleaned[-1] = SubtitleSegment(start=prev.start, end=seg.end, text=seg.text)
+            continue
+
+        cleaned.append(seg)
+
+    total = len(segments)
+    removed = total - len(cleaned)
+    if issues:
+        print(f"\nSubtitle QA: fixed {len(issues)} issue(s) ({removed} segment(s) removed or merged):", flush=True)
+        for issue in issues:
+            print(f"  - {issue}", flush=True)
+    else:
+        print(f"Subtitle QA: {total} segment(s) checked — no issues found.", flush=True)
+
+    return cleaned
+
+
+def write_srt_from_segments(segments: list[SubtitleSegment], srt_path: Path) -> int:
+    """Write sanitized segments to an SRT file. Returns the number of segments written."""
+    clean = sanitize_segments(segments)
+    with srt_path.open("w", encoding="utf-8") as handle:
+        for i, seg in enumerate(clean, 1):
+            handle.write(f"{i}\n{timestamp(seg.start)} --> {timestamp(seg.end)}\n{seg.text}\n\n")
+    return len(clean)
+
+
 def write_srt(
     audio_path: Path,
     srt_path: Path,
@@ -263,11 +587,22 @@ def write_srt(
     compute_type: str,
     task: str,
     language: str | None,
+    gap_fill: bool = True,
+    gap_threshold: float = 3.0,
+    condition_on_previous_text: bool = False,
+    verify: bool = True,
+    traditional: bool = False,
 ) -> tuple[int, dict[str, float], list[SubtitleSegment], str | None]:
     mlx_repo = _MLX_MODEL_MAP.get(model_name) if _MLX_AVAILABLE and device in ("auto", "cpu") else None
     if mlx_repo:
-        return _write_srt_mlx(audio_path, srt_path, mlx_repo, task, language)
-    return _write_srt_faster_whisper(audio_path, srt_path, model_name, device, compute_type, task, language)
+        return _write_srt_mlx(
+            audio_path, srt_path, mlx_repo, task, language,
+            gap_fill, gap_threshold, condition_on_previous_text, verify, traditional,
+        )
+    return _write_srt_faster_whisper(
+        audio_path, srt_path, model_name, device, compute_type, task, language,
+        gap_fill, gap_threshold, condition_on_previous_text, verify, traditional,
+    )
 
 
 def _write_srt_mlx(
@@ -276,12 +611,24 @@ def _write_srt_mlx(
     mlx_repo: str,
     task: str,
     language: str | None,
+    gap_fill: bool = True,
+    gap_threshold: float = 3.0,
+    condition_on_previous_text: bool = False,
+    verify: bool = True,
+    traditional: bool = False,
 ) -> tuple[int, dict[str, float], list[SubtitleSegment], str | None]:
     print(f"Using mlx-whisper ({mlx_repo}) on Apple Silicon GPU", flush=True)
     load_started = time.monotonic()
-    transcribe_kwargs: dict = {"path_or_hf_repo": mlx_repo, "task": task, "verbose": False}
+    transcribe_kwargs: dict = {
+        "path_or_hf_repo": mlx_repo,
+        "task": task,
+        "verbose": False,
+        "condition_on_previous_text": condition_on_previous_text,
+    }
     if language:
         transcribe_kwargs["language"] = language
+    if not traditional and (not language or language.startswith("zh")):
+        transcribe_kwargs["initial_prompt"] = _SIMPLIFIED_CHINESE_PROMPT
     load_elapsed = time.monotonic() - load_started
     duration = media_duration_seconds(audio_path)
     print(f"Transcribing audio with mlx-whisper...", flush=True)
@@ -292,17 +639,43 @@ def _write_srt_mlx(
     print(f"Detected language: {detected_language}", flush=True)
     raw_segments = result.get("segments") or []
     subtitle_segments: list[SubtitleSegment] = []
-    written = 0
-    with srt_path.open("w", encoding="utf-8") as handle:
-        for seg in raw_segments:
-            text = (seg.get("text") or "").strip()
-            if not text:
-                continue
-            written += 1
-            subtitle_segments.append(SubtitleSegment(start=seg["start"], end=seg["end"], text=text))
-            handle.write(f"{written}\n{timestamp(seg['start'])} --> {timestamp(seg['end'])}\n{text}\n\n")
+    for seg in raw_segments:
+        text = (seg.get("text") or "").strip()
+        if not text:
+            continue
+        subtitle_segments.append(SubtitleSegment(start=seg["start"], end=seg["end"], text=text))
     if duration:
         print(f"Transcribing audio: 100% ({clock_timestamp(duration)}/{clock_timestamp(duration)}), elapsed {clock_timestamp(transcribe_elapsed)}", flush=True)
+
+    # Clip transcriber — used by both fill_gaps and verify_and_retry
+    def _mlx_transcribe_clip(clip_path: Path) -> list[SubtitleSegment]:
+        clip_kwargs: dict = {
+            "path_or_hf_repo": mlx_repo,
+            "task": task,
+            "verbose": False,
+            "condition_on_previous_text": False,
+        }
+        if language:
+            clip_kwargs["language"] = language
+        if not traditional and (not language or language.startswith("zh")):
+            clip_kwargs["initial_prompt"] = _SIMPLIFIED_CHINESE_PROMPT
+        clip_result = _mlx_whisper.transcribe(str(clip_path), **clip_kwargs)
+        return [
+            SubtitleSegment(s["start"], s["end"], (s.get("text") or "").strip())
+            for s in (clip_result.get("segments") or [])
+            if (s.get("text") or "").strip()
+        ]
+
+    if gap_fill and duration and subtitle_segments:
+        subtitle_segments = fill_gaps(subtitle_segments, audio_path, duration, gap_threshold, _mlx_transcribe_clip)
+
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if verify and api_key:
+        subtitle_segments = verify_and_retry(subtitle_segments, audio_path, _mlx_transcribe_clip, api_key, language)
+    elif verify and not api_key:
+        print("Skipping LLM verification: ANTHROPIC_API_KEY not set.", flush=True)
+
+    written = write_srt_from_segments(subtitle_segments, srt_path)
     return written, {"model_load": load_elapsed, "transcribe": transcribe_elapsed}, subtitle_segments, detected_language
 
 
@@ -314,13 +687,25 @@ def _write_srt_faster_whisper(
     compute_type: str,
     task: str,
     language: str | None,
+    gap_fill: bool = True,
+    gap_threshold: float = 3.0,
+    condition_on_previous_text: bool = False,
+    verify: bool = True,
+    traditional: bool = False,
 ) -> tuple[int, dict[str, float], list[SubtitleSegment], str | None]:
     model_load_started = time.monotonic()
     model = WhisperModel(model_name, device=device, compute_type=compute_type)
     model_load_elapsed = time.monotonic() - model_load_started
-    transcribe_args = {"task": task, "beam_size": 5, "vad_filter": True}
+    transcribe_args: dict = {
+        "task": task,
+        "beam_size": 5,
+        "vad_filter": True,
+        "condition_on_previous_text": condition_on_previous_text,
+    }
     if language:
         transcribe_args["language"] = language
+    if not traditional and (not language or language.startswith("zh")):
+        transcribe_args["initial_prompt"] = _SIMPLIFIED_CHINESE_PROMPT
     transcribe_started = time.monotonic()
     segments, info = model.transcribe(str(audio_path), **transcribe_args)
     duration = media_duration_seconds(audio_path)
@@ -333,43 +718,35 @@ def _write_srt_faster_whisper(
             flush=True,
         )
 
-    written = 0
     subtitle_segments: list[SubtitleSegment] = []
-    with srt_path.open("w", encoding="utf-8") as handle:
-        for segment in segments:
-            text = segment.text.strip()
-            if not text:
-                continue
-            written += 1
-            subtitle_segments.append(
-                SubtitleSegment(start=segment.start, end=segment.end, text=text)
-            )
-            handle.write(
-                f"{written}\n"
-                f"{timestamp(segment.start)} --> {timestamp(segment.end)}\n"
-                f"{text}\n\n"
-            )
+    for segment in segments:
+        text = segment.text.strip()
+        if not text:
+            continue
+        subtitle_segments.append(
+            SubtitleSegment(start=segment.start, end=segment.end, text=text)
+        )
 
-            if duration:
-                processed = min(segment.end, duration)
-                now = time.monotonic()
-                should_log = (
-                    processed >= duration
-                    or processed - last_logged_at >= 30
-                    or now - start_time < 1
+        if duration:
+            processed = min(segment.end, duration)
+            now = time.monotonic()
+            should_log = (
+                processed >= duration
+                or processed - last_logged_at >= 30
+                or now - start_time < 1
+            )
+            if should_log and processed > 0:
+                elapsed = now - start_time
+                remaining_audio = max(duration - processed, 0.0)
+                eta_seconds = remaining_audio * (elapsed / processed)
+                percent = min(100, int((processed / duration) * 100))
+                print(
+                    "Transcribing audio: "
+                    f"{percent:02}% ({clock_timestamp(processed)}/{clock_timestamp(duration)}), "
+                    f"ETA {clock_timestamp(eta_seconds)}",
+                    flush=True,
                 )
-                if should_log and processed > 0:
-                    elapsed = now - start_time
-                    remaining_audio = max(duration - processed, 0.0)
-                    eta_seconds = remaining_audio * (elapsed / processed)
-                    percent = min(100, int((processed / duration) * 100))
-                    print(
-                        "Transcribing audio: "
-                        f"{percent:02}% ({clock_timestamp(processed)}/{clock_timestamp(duration)}), "
-                        f"ETA {clock_timestamp(eta_seconds)}",
-                        flush=True,
-                    )
-                    last_logged_at = processed
+                last_logged_at = processed
 
     if duration:
         total_elapsed = time.monotonic() - start_time
@@ -378,6 +755,35 @@ def _write_srt_faster_whisper(
             f"ETA 00:00:00, elapsed {clock_timestamp(total_elapsed)}",
             flush=True,
         )
+
+    # Clip transcriber — used by both fill_gaps and verify_and_retry
+    def _fw_transcribe_clip(clip_path: Path) -> list[SubtitleSegment]:
+        clip_args: dict = {
+            "task": task,
+            "beam_size": 5,
+            "vad_filter": True,
+            "condition_on_previous_text": False,
+        }
+        if language:
+            clip_args["language"] = language
+        if not traditional and (not language or language.startswith("zh")):
+            clip_args["initial_prompt"] = _SIMPLIFIED_CHINESE_PROMPT
+        clip_segments, _ = model.transcribe(str(clip_path), **clip_args)
+        return [
+            SubtitleSegment(s.start, s.end, s.text.strip())
+            for s in clip_segments if s.text.strip()
+        ]
+
+    if gap_fill and duration and subtitle_segments:
+        subtitle_segments = fill_gaps(subtitle_segments, audio_path, duration, gap_threshold, _fw_transcribe_clip)
+
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if verify and api_key:
+        subtitle_segments = verify_and_retry(subtitle_segments, audio_path, _fw_transcribe_clip, api_key, language)
+    elif verify and not api_key:
+        print("Skipping LLM verification: ANTHROPIC_API_KEY not set.", flush=True)
+
+    written = write_srt_from_segments(subtitle_segments, srt_path)
     return written, {
         "model_load": model_load_elapsed,
         "transcribe": time.monotonic() - transcribe_started,
@@ -442,6 +848,33 @@ def parse_args() -> argparse.Namespace:
         "--include-summary-images",
         action="store_true",
         help="Add representative frame pages to the PDF summary.",
+    )
+    parser.add_argument(
+        "--no-gap-fill",
+        action="store_true",
+        help="Disable gap detection and re-transcription of skipped sections. Default: gap-fill is on.",
+    )
+    parser.add_argument(
+        "--gap-threshold",
+        type=float,
+        default=3.0,
+        metavar="SECS",
+        help="Minimum silence gap in seconds to trigger re-transcription. Default: 3.0",
+    )
+    parser.add_argument(
+        "--condition-on-previous-text",
+        action="store_true",
+        help="Re-enable Whisper conditioning on its own previous output (may cause repetition loops). Default: off.",
+    )
+    parser.add_argument(
+        "--no-verify",
+        action="store_true",
+        help="Disable LLM semantic verification and retry of suspect segments. Default: on if ANTHROPIC_API_KEY is set.",
+    )
+    parser.add_argument(
+        "--traditional",
+        action="store_true",
+        help="Output traditional Chinese characters instead of simplified. Default: simplified Chinese.",
     )
     return parser.parse_args()
 
@@ -532,6 +965,11 @@ def main() -> int:
             args.compute_type,
             args.task,
             args.language,
+            gap_fill=not args.no_gap_fill,
+            gap_threshold=args.gap_threshold,
+            condition_on_previous_text=args.condition_on_previous_text,
+            verify=not args.no_verify,
+            traditional=args.traditional,
         )
         timings.update(transcription_timings)
         if subtitle_count:
