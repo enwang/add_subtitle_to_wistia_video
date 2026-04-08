@@ -331,7 +331,7 @@ def _call_coherence_tool(lines: list[str], api_key: str, language: str | None) -
     if not _ANTHROPIC_AVAILABLE:
         return {}
     lang_hint = f" The video is in language code '{language}'." if language else ""
-    hallucination_examples = "感谢观看, 请订阅, 字幕提供, 敬请期待, 如果你觉得有用请点赞"
+    hallucination_examples = "感谢收看, 感谢观看, 感谢您的观看, 请订阅, 请记得订阅, 别忘了点赞, 字幕提供, 敬请期待, 如果你觉得有用请点赞, 谢谢收看, 多谢收看"
     prompt = (
         f"You are reviewing auto-generated subtitles for a Cantonese/Mandarin financial video.{lang_hint}\n"
         "Each line is formatted as INDEX: [HH:MM:SS] subtitle_text.\n\n"
@@ -460,7 +460,20 @@ def verify_and_retry(
                     continue
 
                 if not new_segs:
-                    print(f"    No speech found in clip; keeping original.", flush=True)
+                    if is_hallucination(seg.text):
+                        print(f"    No speech found; original was hallucination — dropped.", flush=True)
+                        result = result[:current_idx] + result[current_idx + 1:]
+                        offset -= 1
+                    else:
+                        print(f"    No speech found in clip; keeping original.", flush=True)
+                    continue
+
+                # Filter hallucinations out of re-transcription result
+                clean_segs = [s for s in new_segs if not is_hallucination(s.text)]
+                if not clean_segs:
+                    print(f"    Re-transcription also hallucination — dropped.", flush=True)
+                    result = result[:current_idx] + result[current_idx + 1:]
+                    offset -= 1
                     continue
 
                 adjusted = [
@@ -469,7 +482,7 @@ def verify_and_retry(
                         end=s.end + seg.start,
                         text=s.text,
                     )
-                    for s in new_segs
+                    for s in clean_segs
                 ]
                 new_text = " / ".join(s.text for s in adjusted)
                 print(f"    Fixed: {seg.text!r} → {new_text!r}", flush=True)
@@ -481,6 +494,100 @@ def verify_and_retry(
         return segments
 
     print(f"LLM verification: complete. {len(segments)} → {len(result)} segment(s).", flush=True)
+    return result
+
+
+# Known Whisper hallucination phrases to strip unconditionally.
+# These are Whisper's common "filler" outputs when it encounters silence or low-confidence audio.
+_HALLUCINATION_SUBSTRINGS: tuple[str, ...] = (
+    "感谢收看",
+    "感谢观看",
+    "感谢您的观看",
+    "谢谢收看",
+    "多谢收看",
+    "请订阅",
+    "记得订阅",
+    "别忘了点赞",
+    "请点赞",
+    "不吝点赞",
+    "欢迎点赞",
+    "欢迎订阅",
+    "请不吝",
+    "打赏",
+    "转发支持",
+    "字幕提供",
+    "敬请期待",
+    "Thank you for watching",
+    "Thanks for watching",
+    "Please subscribe",
+    "Don't forget to like",
+)
+
+
+def is_hallucination(text: str) -> bool:
+    return any(phrase in text for phrase in _HALLUCINATION_SUBSTRINGS)
+
+
+def retranscribe_hallucinations(
+    segments: list[SubtitleSegment],
+    audio_path: Path,
+    transcribe_clip: Callable[[Path], list[SubtitleSegment]],
+) -> list[SubtitleSegment]:
+    """Find segments containing known hallucination phrases, re-transcribe their audio windows.
+    Replaces with clean result if found; otherwise drops the segment entirely."""
+    flagged_indices = [i for i, seg in enumerate(segments) if is_hallucination(seg.text)]
+    if not flagged_indices:
+        return segments
+
+    print(f"\nHallucination retranscribe: {len(flagged_indices)} segment(s) to retry...", flush=True)
+    result: list[SubtitleSegment] = list(segments)
+    offset = 0
+
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for original_idx in flagged_indices:
+                current_idx = original_idx + offset
+                if current_idx >= len(result):
+                    continue
+                seg = result[current_idx]
+                clip_path = Path(tmpdir) / f"halluc_{original_idx}.m4a"
+                print(
+                    f"  Retrying [{timestamp(seg.start)} → {timestamp(seg.end)}] {seg.text!r}",
+                    flush=True,
+                )
+                try:
+                    extract_audio_clip(audio_path, seg.start, seg.end, clip_path)
+                    new_segs = transcribe_clip(clip_path)
+                except Exception as exc:
+                    print(f"    Re-transcription failed ({exc}), dropping segment.", flush=True)
+                    result = result[:current_idx] + result[current_idx + 1:]
+                    offset -= 1
+                    continue
+
+                # Filter hallucinations out of new results too
+                clean_segs = [s for s in new_segs if not is_hallucination(s.text)]
+                if not clean_segs:
+                    print(f"    Still hallucination or no speech — dropped.", flush=True)
+                    result = result[:current_idx] + result[current_idx + 1:]
+                    offset -= 1
+                else:
+                    adjusted = [
+                        SubtitleSegment(
+                            start=s.start + seg.start,
+                            end=s.end + seg.start,
+                            text=s.text,
+                        )
+                        for s in clean_segs
+                    ]
+                    new_text = " / ".join(s.text for s in adjusted)
+                    print(f"    Recovered: {new_text!r}", flush=True)
+                    result = result[:current_idx] + adjusted + result[current_idx + 1:]
+                    offset += len(adjusted) - 1
+    except Exception as exc:
+        print(f"Hallucination retranscribe: failed ({exc}), falling back to drop-only filter.", flush=True)
+        return [seg for seg in segments if not is_hallucination(seg.text)]
+
+    print(f"Hallucination retranscribe: complete. {len(segments)} → {len(result)} segment(s).", flush=True)
     return result
 
 
@@ -570,9 +677,25 @@ def sanitize_segments(segments: list[SubtitleSegment]) -> list[SubtitleSegment]:
     return cleaned
 
 
+def strip_known_hallucinations(segments: list[SubtitleSegment]) -> list[SubtitleSegment]:
+    """Remove segments whose text contains a known Whisper hallucination phrase."""
+    kept = []
+    removed = 0
+    for seg in segments:
+        if any(phrase in seg.text for phrase in _HALLUCINATION_SUBSTRINGS):
+            print(f"  Hallucination filter: removed [{timestamp(seg.start)}] {seg.text!r}", flush=True)
+            removed += 1
+        else:
+            kept.append(seg)
+    if removed:
+        print(f"Hallucination filter: removed {removed} segment(s).", flush=True)
+    return kept
+
+
 def write_srt_from_segments(segments: list[SubtitleSegment], srt_path: Path) -> int:
     """Write sanitized segments to an SRT file. Returns the number of segments written."""
     clean = sanitize_segments(segments)
+    clean = strip_known_hallucinations(clean)
     with srt_path.open("w", encoding="utf-8") as handle:
         for i, seg in enumerate(clean, 1):
             handle.write(f"{i}\n{timestamp(seg.start)} --> {timestamp(seg.end)}\n{seg.text}\n\n")
@@ -674,6 +797,8 @@ def _write_srt_mlx(
         subtitle_segments = verify_and_retry(subtitle_segments, audio_path, _mlx_transcribe_clip, api_key, language)
     elif verify and not api_key:
         print("Skipping LLM verification: ANTHROPIC_API_KEY not set.", flush=True)
+
+    subtitle_segments = retranscribe_hallucinations(subtitle_segments, audio_path, _mlx_transcribe_clip)
 
     written = write_srt_from_segments(subtitle_segments, srt_path)
     return written, {"model_load": load_elapsed, "transcribe": transcribe_elapsed}, subtitle_segments, detected_language
@@ -782,6 +907,8 @@ def _write_srt_faster_whisper(
         subtitle_segments = verify_and_retry(subtitle_segments, audio_path, _fw_transcribe_clip, api_key, language)
     elif verify and not api_key:
         print("Skipping LLM verification: ANTHROPIC_API_KEY not set.", flush=True)
+
+    subtitle_segments = retranscribe_hallucinations(subtitle_segments, audio_path, _fw_transcribe_clip)
 
     written = write_srt_from_segments(subtitle_segments, srt_path)
     return written, {
