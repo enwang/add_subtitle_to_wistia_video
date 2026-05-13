@@ -970,9 +970,9 @@ def parse_args() -> argparse.Namespace:
         help="Optional clip duration for short test runs, for example 00:00:20.",
     )
     parser.add_argument(
-        "--skip-summary-pdf",
+        "--summary-pdf",
         action="store_true",
-        help="Skip generating the companion PDF summary file.",
+        help="Generate a companion PDF summary file.",
     )
     parser.add_argument(
         "--include-summary-images",
@@ -1124,7 +1124,7 @@ def main() -> int:
             run([ffmpeg, "-y", "-i", str(source_path), "-c", "copy", str(output_path)])
             timings["copy_output"] = time.monotonic() - stage_started
 
-        if not args.skip_summary_pdf:
+        if args.summary_pdf:
             stage_started = time.monotonic()
             print("Generating PDF summary...", flush=True)
             build_summary_pdf(
@@ -1169,7 +1169,7 @@ def main() -> int:
             print(f"  {label}: {elapsed_label(timings[label])}", flush=True)
 
     print(f"Wrote {output_path}")
-    if not args.skip_summary_pdf:
+    if args.summary_pdf:
         print(f"Wrote {pdf_summary_path}")
     return 0
 
