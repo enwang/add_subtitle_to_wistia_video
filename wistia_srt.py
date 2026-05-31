@@ -528,7 +528,12 @@ _HALLUCINATION_SUBSTRINGS: tuple[str, ...] = (
 
 
 def is_hallucination(text: str) -> bool:
-    return any(phrase in text for phrase in _HALLUCINATION_SUBSTRINGS)
+    if any(phrase in text for phrase in _HALLUCINATION_SUBSTRINGS):
+        return True
+    # Whisper repetition loop: any CJK character (or any char) repeated 3+ times consecutively
+    if re.search(r'(.)\1{2,}', text):
+        return True
+    return False
 
 
 def retranscribe_hallucinations(
@@ -975,6 +980,11 @@ def parse_args() -> argparse.Namespace:
         help="Generate a companion PDF summary file.",
     )
     parser.add_argument(
+        "--summary-md",
+        action="store_true",
+        help="Generate a companion Markdown summary file (executive narrative + deep-dive outline).",
+    )
+    parser.add_argument(
         "--include-summary-images",
         action="store_true",
         help="Add representative frame pages to the PDF summary.",
@@ -1025,6 +1035,7 @@ def main() -> int:
     audio_path = output_path.with_suffix(".m4a")
     srt_path = output_path.with_suffix(".srt")
     pdf_summary_path = output_path.with_suffix(".summary.pdf")
+    md_summary_path = output_path.with_suffix(".summary.md")
     timings: dict[str, float] = {}
     total_started = time.monotonic()
     subtitle_segments: list[SubtitleSegment] = []
@@ -1139,6 +1150,20 @@ def main() -> int:
                 ffprobe_binary(),
             )
             timings["summary_pdf"] = time.monotonic() - stage_started
+
+        if args.summary_md:
+            stage_started = time.monotonic()
+            print("Generating Markdown summary...", flush=True)
+            from summary_pdf import generate_llm_summary, render_summary_markdown
+            llm_summary = generate_llm_summary(subtitle_segments)
+            if llm_summary:
+                md_summary_path.write_text(
+                    render_summary_markdown(llm_summary, video_title=output_path.stem),
+                    encoding="utf-8",
+                )
+                timings["summary_md"] = time.monotonic() - stage_started
+            else:
+                print("  [summary] Markdown summary skipped (LLM unavailable).", flush=True)
     except subprocess.CalledProcessError as exc:
         print(f"Command failed with exit code {exc.returncode}.", file=sys.stderr)
         return exc.returncode
@@ -1163,6 +1188,7 @@ def main() -> int:
         "subtitle_burn",
         "copy_output",
         "summary_pdf",
+        "summary_md",
         "total",
     ):
         if label in timings:
@@ -1171,6 +1197,8 @@ def main() -> int:
     print(f"Wrote {output_path}")
     if args.summary_pdf:
         print(f"Wrote {pdf_summary_path}")
+    if args.summary_md and md_summary_path.exists():
+        print(f"Wrote {md_summary_path}")
     return 0
 
 

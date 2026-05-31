@@ -418,22 +418,29 @@ def _chunk_transcript(segments: list[SubtitleLike], chunk_minutes: float = 15.0)
 
 
 def _map_chunk(client: object, chunk_index: int, total_chunks: int, start: float, end: float, text: str) -> str:
-    """Summarize a single transcript chunk with Claude Haiku (map phase)."""
+    """Summarize a single transcript chunk with Claude Haiku (map phase).
+
+    The reduce phase needs raw material to compose specific narrative paragraphs,
+    so we ask the map phase to preserve numbers, tickers, and reasoning verbatim.
+    """
     prompt = (
         f"以下是一段粤语/普通话财经视频的第 {chunk_index}/{total_chunks} 段字幕"
         f"（时间 {_fmt_time(start)} - {_fmt_time(end)}）。\n\n"
-        "请用简体中文总结这段内容，包括：\n"
-        "1. 主要讨论的话题、主题或股票方向\n"
-        "2. 提到的所有股票代码和公司名称（尽量完整）\n"
-        "3. 具体的数据指标（涨跌幅、价格区间、筛选条件等）\n"
-        "4. 讲者的核心观点和分析逻辑\n\n"
+        "请用简体中文整理这段内容，目标是为下一步生成详细摘要保留全部原始素材。请按以下结构输出：\n\n"
+        "【主题/方向】：本段讨论的核心话题（一两句话）。\n"
+        "【提到的公司/票号/板块】：完整列出，逐个用顿号分隔。\n"
+        "【具体数字/数据】：完整保留涨跌幅、营收增长率、净留存率、短仓占比、年份、估值、"
+        "价格区间、筛选条件等任何数字。这一项不要总结，要按出现顺序逐条列举。\n"
+        "【讲者论点 & 推理链条】：用 3-6 句话还原讲者的论证（“因为...所以...”、“如果...则...”、"
+        "“市场原本担心 X，但是 Y”、举例说明等）。\n"
+        "【金句/原话片段】：摘抄 1-2 句最能代表讲者立场的原话（保留口语风格即可）。\n\n"
         f"字幕内容：\n{text}\n\n"
-        "请输出结构化段落总结（用完整中文句子，不要用bullet points）。"
+        "请直接输出上述五个标签段，不要加任何前言或结语。"
     )
     import anthropic as _anthropic
     response = _anthropic.Anthropic().messages.create(
         model="claude-haiku-4-5-20251001",  # cheapest model
-        max_tokens=900,
+        max_tokens=1400,
         messages=[{"role": "user", "content": prompt}],
         temperature=0.0,
     )
@@ -465,103 +472,151 @@ def _call_tool(prompt: str, tool: dict, max_tokens: int = 6000) -> dict:
     raise ValueError(f"No {tool['name']} tool_use block found in response")
 
 
-def _reduce_overview(summaries_text: str, tickers_str: str, duration_str: str) -> dict:
-    """Reduce call 1: overview, methodology, data points, meta fields."""
+def _reduce_sections(summaries_text: str, tickers_str: str, duration_str: str) -> dict:
+    """Single reduce call: build a two-part summary (executive narrative + deep-dive outline).
+
+    Returns a dict with:
+      - one_line_takeaway: 20-char hook
+      - executive_summary: 4-8 narrative paragraphs ({label, content}) — the "影片重點總結" layer
+      - outline: 3-6 strings — the "大綱" listing of deep-dive topics
+      - sections: list of {title, points: [{label?, content, sub_points?: [{label?, content}]}]} —
+                  the "圖表教學總結" layer
+      - keywords: up to 24 keywords
+    """
     prompt = (
-        f"以下是一个{duration_str}粤语财经视频的分段总结。请调用 write_overview 工具输出分析和摘要部分。\n\n"
+        f"以下是一个 {duration_str} 财经视频的分段总结。请调用 write_summary 工具，"
+        "输出一份**两层结构**的中文摘要：\n"
+        "  (A) executive_summary — 高层叙事段落（导读层）；\n"
+        "  (B) outline + sections — 大纲 + 多章节深入展开（深入层）。\n\n"
+        "视频类型可能是：图表教学、市场分析、直播 Q&A、个股深度、宏观点评、交易策略复盘等。"
+        "请根据**视频实际内容**为两层结构各取一个**自然的中文标题**：\n"
+        "  • executive_title：导读层的标题（4-10 字），例如 “影片重点总结”、“直播要点”、"
+        "“市场速读”、“核心观点速览”等，由内容决定。\n"
+        "  • deep_dive_title：深入层的标题（4-10 字），例如 “图表教学总结”、“分主题展开”、"
+        "“热门板块深读”、“Q&A 整理”等，由内容决定。\n"
+        "不要套用模板；如果视频是 Q&A，标题应反映 Q&A；如果是个股深度，应反映个股。\n\n"
         f"视频中提到的股票代码：{tickers_str}\n\n"
         f"分段总结：\n{summaries_text}\n\n"
-        "输出要求（所有文字用简体中文，内容必须具体，基于实际视频内容）：\n"
-        "- one_line_takeaway：一句话（20字以内）总结视频最核心的信息\n"
-        "- intro_paragraphs：恰好3段，每段2-3句，每段不超过80字，总结视频核心目标、主要发现和实用价值\n"
-        "- method_paragraphs：恰好5段，每段2-3句，每段不超过80字，说明筛选标准，必须包含具体数字和条件\n"
-        "- key_data_points：视频中提到的具体数据（涨跌幅、百分比、条件数值等），最多20条，每条不超过40字\n"
-        "- keywords：最多20个关键词，包括股票代码、板块名称、核心概念\n"
-        "- closing_paragraphs：恰好3段，每段2-3句，每段不超过80字，讲者的最终建议和注意事项"
+        "—— 输出语言：默认简体中文；若分段总结明显以繁体中文出现专有词（如“軋空”、“板塊輪動”），可保留繁体。"
+        "不要用 bullet points 写成短语堆叠，必须使用完整中文句子。\n\n"
+        "—— one_line_takeaway：一句话（20字以内）总结视频最核心的信息。\n\n"
+        "—— executive_summary：4-8 段叙事性段落，每段包含：\n"
+        "    • label：6-14 字的小标题，反映该段的核心论点（标题应反映视频实际内容）\n"
+        "    • content：100-260 字的完整段落。要求：\n"
+        "        ① 用陈述句把讲者的观点串成可读的小故事，不要列点；\n"
+        "        ② 完整保留具体数字（涨跌幅、营收增长率、短仓占比、年份、净留存率等）；\n"
+        "        ③ 提到的公司/板块要带英文票号或正式名称；\n"
+        "        ④ 体现讲者的“因为...所以...”推理链条；\n"
+        "        ⑤ 段落之间要可以独立阅读，但合在一起像一篇导读。\n\n"
+        "—— outline：3-6 项主题词（10 字以内），将作为 sections 的目录索引展示在深入层开头。"
+        "如果视频结构上不适合大纲（例如完全自由的对谈），可以返回空数组。\n\n"
+        "—— sections：3-6 个章节深入展开。每个章节：\n"
+        "    • title：10-20 字章节标题（不要加“一、”前缀，代码自动加）\n"
+        "    • points：2-5 个编号要点。每个要点包含：\n"
+        "        - label：（可选）6-15 字小标题\n"
+        "        - content：80-260 字段落。必须包含具体数字、股票或板块代码、讲者推理。"
+        "如果要点实质内容主要在 sub_points 中，content 可以是 1-2 句引子或空字符串\n"
+        "        - sub_points：（可选）0-5 个子要点。每个：\n"
+        "            * label：（可选）4-12 字标签（如“通讯与身分验证服务”、“设计平台（如 Figma）”、"
+        "“极高的轧空机会”）\n"
+        "            * content：40-200 字具体内容\n\n"
+        "—— keywords：最多 20 个关键词（股票代码、板块名称、核心概念）。\n\n"
+        "————————————————————————\n"
+        "（仅作结构示例；标题与内容必须根据视频实际素材决定，不要照抄。）\n"
+        "executive_summary 段落样例：\n"
+        "  {label: \"市场高风险警告\", content: \"讲者对近期市场发出警示，提醒投资者必须提高风险"
+        "意识。他指出，如果投资者“过贪”，可能会将今年以来累积的主要获利全部回吐。\"}\n"
+        "  {label: \"板块轮动与中期调整\", content: \"讲者观察到市场领头羊及多个板块出现了下跌迹象，"
+        "包括光通讯、AI 以及 NVIDIA、AMD、Intel 等相关科技股均出现单日数个百分比的跌幅。他警告市场"
+        "极有可能进入“中期调整”，在此情况下，大型股可能面临 10% 到 20% 的修正，而中小型股的跌幅"
+        "甚至可达 30%。\"}\n\n"
+        "sections 章节样例（结构参考）：\n"
+        "  {title: \"半导体与核心 AI 股票的风险警告\", points: [\n"
+        "    {label: \"估值极端 & 均值回归风险\", content: \"目前的半导体类股（如 SOXX、SMH）以及 "
+        "AI 领先指标股票的估值已经来到了非常极端的水平，面临“均值回归”的风险...\"},\n"
+        "    {label: \"投资焦点转移建议\", content: \"\", sub_points: [\n"
+        "        {label: \"获利了结部分持股\", content: \"...\"},\n"
+        "        {label: \"转向其他具备潜力的产业\", content: \"...\"},\n"
+        "    ]},\n"
+        "  ]}\n\n"
+        "重要原则：\n"
+        "- 严格依据视频实际内容，不要编造未提及的数据或公司\n"
+        "- 完整保留所有具体数字（涨跌幅、日期、估值、占比、营收增长率、短仓占比、时间周期等）\n"
+        "- 保留讲者的推理链条（不只是结论，还要有“为什么”）\n"
+        "- executive_summary 与 sections 之间允许有内容重叠，但叙事角度不同：前者是连续叙事，"
+        "  后者是分主题展开\n"
+        "- 不要使用泛泛而谈的套话（如“投资者应注意风险”、“建议谨慎操作”）"
     )
+    para_schema = {
+        "type": "object",
+        "properties": {
+            "label": {"type": "string"},
+            "content": {"type": "string"},
+        },
+        "required": ["content"],
+    }
     tool = {
-        "name": "write_overview",
-        "description": "Output overview, methodology and meta sections",
+        "name": "write_summary",
+        "description": "Output a two-part summary: executive narrative + structured deep-dive",
         "input_schema": {
             "type": "object",
             "properties": {
                 "one_line_takeaway": {"type": "string"},
-                "intro_paragraphs": {"type": "array", "items": {"type": "string"}},
-                "method_paragraphs": {"type": "array", "items": {"type": "string"}},
-                "key_data_points": {"type": "array", "maxItems": 20, "items": {"type": "string"}},
-                "keywords": {"type": "array", "maxItems": 25, "items": {"type": "string"}},
-                "closing_paragraphs": {"type": "array", "items": {"type": "string"}},
-            },
-            "required": ["one_line_takeaway", "intro_paragraphs", "method_paragraphs", "key_data_points", "keywords", "closing_paragraphs"],
-        },
-    }
-    return _call_tool(prompt, tool, max_tokens=6000)
-
-
-def _reduce_themes(summaries_text: str, tickers_str: str, duration_str: str) -> dict:
-    """Reduce call 2: themes, per-stock analysis, market insights."""
-    prompt = (
-        f"以下是一个{duration_str}粤语财经视频的分段总结。请调用 write_themes 工具输出主题分析部分。\n\n"
-        f"视频中提到的股票代码：{tickers_str}\n\n"
-        f"分段总结：\n{summaries_text}\n\n"
-        "输出要求（所有文字用简体中文，内容必须具体，基于实际视频内容，不要泛泛而谈）：\n"
-        "- themes：列出4-6个重要主题，每个主题写3段说明（每段2-3句不超过80字），examples填该主题代表股票代码\n"
-        "- stock_analyses：选出最重要的8-12支股票，每支写一段分析（股票代码+公司名+讲者观点，不超过80字），最多12支\n"
-        "- market_insights：最多15条市场洞察，每条不超过40字"
-    )
-    tool = {
-        "name": "write_themes",
-        "description": "Output theme analyses, per-stock analyses, and market insights",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "themes": {
+                "executive_title": {"type": "string"},
+                "deep_dive_title": {"type": "string"},
+                "executive_summary": {
                     "type": "array",
-                    "maxItems": 6,
+                    "maxItems": 10,
+                    "items": para_schema,
+                },
+                "outline": {
+                    "type": "array",
+                    "maxItems": 8,
+                    "items": {"type": "string"},
+                },
+                "sections": {
+                    "type": "array",
+                    "maxItems": 7,
                     "items": {
                         "type": "object",
                         "properties": {
                             "title": {"type": "string"},
-                            "paragraphs": {"type": "array", "maxItems": 5, "items": {"type": "string"}},
-                            "examples": {"type": "array", "maxItems": 6, "items": {"type": "string"}},
+                            "points": {
+                                "type": "array",
+                                "maxItems": 8,
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "label": {"type": "string"},
+                                        "content": {"type": "string"},
+                                        "sub_points": {
+                                            "type": "array",
+                                            "maxItems": 6,
+                                            "items": para_schema,
+                                        },
+                                    },
+                                    "required": ["content"],
+                                },
+                            },
                         },
-                        "required": ["title", "paragraphs", "examples"],
+                        "required": ["title", "points"],
                     },
                 },
-                "stock_analyses": {
-                    "type": "array",
-                    "maxItems": 12,
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "ticker": {"type": "string"},
-                            "analysis": {"type": "string"},
-                        },
-                        "required": ["ticker", "analysis"],
-                    },
-                },
-                "market_insights": {"type": "array", "maxItems": 15, "items": {"type": "string"}},
+                "keywords": {"type": "array", "maxItems": 24, "items": {"type": "string"}},
             },
-            "required": ["themes", "stock_analyses", "market_insights"],
+            "required": ["one_line_takeaway", "sections"],
         },
     }
-    return _call_tool(prompt, tool, max_tokens=8000)
+    return _call_tool(prompt, tool, max_tokens=16000)
 
 
 def _reduce_summary(client: object, chunk_summaries: list[str], all_tickers: list[str], total_duration_seconds: float = 0) -> dict:
-    """Synthesize chunk summaries into a structured final summary.
-    Uses two parallel tool-use calls to maximise output depth."""
+    """Synthesize chunk summaries into a structured section-tree summary."""
+    del client
     summaries_text = "\n\n".join(f"【第{i + 1}段总结】\n{s}" for i, s in enumerate(chunk_summaries))
     tickers_str = "、".join(all_tickers[:20]) if all_tickers else "（未检测到）"
     dur = _duration_str(total_duration_seconds, len(chunk_summaries))
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-        f_overview = executor.submit(_reduce_overview, summaries_text, tickers_str, dur)
-        f_themes = executor.submit(_reduce_themes, summaries_text, tickers_str, dur)
-        overview = f_overview.result()
-        themes_data = f_themes.result()
-
-    return {**overview, **themes_data}
+    return _reduce_sections(summaries_text, tickers_str, dur)
 
 
 def generate_llm_summary(segments: list[SubtitleLike]) -> dict | None:
@@ -748,144 +803,237 @@ def _coerce_list(val: object) -> list:
     return []
 
 
+LABELED_PARA_RE = re.compile(r"^\s*\*?\*?(.{2,20}?)\*?\*?\s*[：:]\s*(.+)$", re.DOTALL)
+
+
+def _split_labeled_para(item: object) -> tuple[str | None, str]:
+    """Return (label, content) if item carries a label/content shape; otherwise (None, text).
+
+    For dict items, returns the label whenever present, even if content is empty —
+    callers may render the label alone when substance lives in nested sub_points.
+    """
+    if isinstance(item, dict):
+        label = (item.get("label") or "").strip() or None
+        content = (item.get("content") or "").strip()
+        return label, content
+    text = str(item).strip()
+    if not text:
+        return None, ""
+    match = LABELED_PARA_RE.match(text)
+    if match:
+        candidate_label = match.group(1).strip().strip("*")
+        candidate_content = match.group(2).strip()
+        if candidate_label and candidate_content and len(candidate_label) <= 18:
+            return candidate_label, candidate_content
+    return None, text
+
+
+CJK_NUMERALS = ["一", "二", "三", "四", "五", "六", "七", "八", "九", "十"]
+
+
+def _section_title_line(index: int, raw_title: str) -> str:
+    numeral = CJK_NUMERALS[index] if index < len(CJK_NUMERALS) else str(index + 1)
+    clean = simplify_summary_text(raw_title.strip())[:30] or "主题"
+    return f"{numeral}、{clean}"
+
+
 def _build_llm_blocks(llm_summary: dict, wrap_width: int) -> list[list[str]]:
     """Build page blocks from LLM-generated summary dict.
 
-    All lists are sliced in code regardless of LLM output length.
-    Each paragraph is hard-capped at MAX_PARA_LINES to prevent page overflow.
+    New schema:
+      {one_line_takeaway, sections: [{title, points: [{label?, content, sub_points?: [{label?, content}]}]}], keywords}
     """
     blocks: list[list[str]] = []
-    MAX_PARA_LINES = 6  # each paragraph renders at most this many lines
+    MAX_PARA_LINES = 8           # ~352 chars per paragraph at wrap_width=44
+    MAX_SUBPOINT_LINES = 5       # ~220 chars per sub-bullet body
+    MAX_POINTS_PER_SECTION = 6
+    MAX_SUBPOINTS = 5
 
-    def _para_lines(text: str) -> list[str]:
-        """Wrap text and cap to MAX_PARA_LINES, appending … if truncated."""
+    def _para_lines(text: str, cap: int = MAX_PARA_LINES) -> list[str]:
+        """Wrap text and cap line count, appending … if truncated."""
         lines = wrap_cjk_text(text.strip(), wrap_width)
-        if len(lines) > MAX_PARA_LINES:
-            lines = lines[:MAX_PARA_LINES]
+        if len(lines) > cap:
+            lines = lines[:cap]
             lines[-1] = lines[-1][: wrap_width - 1] + "…"
         return lines
-
-    def _block(heading: str, paragraphs: list[str], max_paras: int = 5) -> list[str]:
-        """Heading + body paragraphs, each capped at MAX_PARA_LINES lines."""
-        block = [heading, ""]
-        for para in paragraphs[:max_paras]:
-            para = para.strip()
-            if para:
-                block.extend(_para_lines(para))
-                block.append("")
-        return block[:-1] if block and block[-1] == "" else block
-
-    def _bullet_block(heading: str, items: list[str], max_items: int = 20) -> list[str]:
-        """Heading + single-line bullet items (▸ prefix, no wrapping)."""
-        block = [heading, ""]
-        for item in items[:max_items]:
-            item = item.strip()
-            if not item:
-                continue
-            if len(item) > wrap_width - 3:
-                item = item[: wrap_width - 4] + "…"
-            block.append(f"▸ {item}")
-        return block
 
     # ── One-line takeaway ───────────────────────────────────────────
     takeaway = (llm_summary.get("one_line_takeaway") or "").strip()
     if takeaway:
         blocks.append(["一句话总结", "", *wrap_cjk_text(takeaway, wrap_width)[:2]])
 
-    # ── Core conclusions (3 paras max) ──────────────────────────────
-    overview_paras = _coerce_list(llm_summary.get("intro_paragraphs"))
-    if overview_paras:
-        blocks.append(_block("核心结论", overview_paras, max_paras=3))
+    # ── Sections (the main content) ─────────────────────────────────
+    # Section heading is its own block so a heavy first point (8 lines + 5
+    # sub-points) still fits within the 1920px page budget. Worst-case
+    # standalone point block: 56 + 8*44 + 5*(26+50+5*44) = 1888 + 18 padding.
+    sections = _coerce_list(llm_summary.get("sections"))[:len(CJK_NUMERALS)]
+    for s_idx, section in enumerate(sections):
+        if not isinstance(section, dict):
+            continue
+        title = (section.get("title") or "").strip()
+        points = _coerce_list(section.get("points"))[:MAX_POINTS_PER_SECTION]
+        if not title and not points:
+            continue
+        section_heading = _section_title_line(s_idx, title)
+        blocks.append([section_heading])
 
-    # ── Screening methodology (5 paras max) ─────────────────────────
-    method_paras = _coerce_list(llm_summary.get("method_paragraphs"))
-    if method_paras:
-        blocks.append(_block("筛选框架", method_paras, max_paras=5))
+        for p_idx, point in enumerate(points):
+            block: list[str] = []
+            label, content = _split_labeled_para(point)
+            sub_points = _coerce_list(point.get("sub_points") if isinstance(point, dict) else None)[:MAX_SUBPOINTS]
 
-    # ── Key data points (20 bullets max) ────────────────────────────
-    data_points = _coerce_list(llm_summary.get("key_data_points"))
-    if data_points:
-        blocks.append(_bullet_block("关键数据", data_points, max_items=20))
+            header = f"{p_idx + 1}. {label}" if label else f"{p_idx + 1}."
+            block.append(header)
+            if content:
+                block.extend(_para_lines(content))
 
-    # ── Themes (6 themes max, 3 paras each) ─────────────────────────
-    themes = _coerce_list(llm_summary.get("themes"))
-    if themes:
-        themes = themes[:6]
-        theme_label = "五个主题" if len(themes) == 5 else f"{len(themes)}个主题"
-        theme_intro = [theme_label, ""]
-        theme_intro.extend(wrap_cjk_text(f"以下{theme_label}是视频分析的核心方向。", wrap_width)[:2])
-        blocks.append(theme_intro)
+            for sub in sub_points:
+                sub_label, sub_content = _split_labeled_para(sub)
+                if not sub_content:
+                    continue
+                block.append("")
+                if sub_label:
+                    block.append(f"◦ {sub_label}")
+                    block.extend(_para_lines(sub_content, cap=MAX_SUBPOINT_LINES))
+                else:
+                    sub_lines = _para_lines(sub_content, cap=MAX_SUBPOINT_LINES)
+                    if sub_lines:
+                        sub_lines[0] = f"◦ {sub_lines[0]}"
+                    block.extend(sub_lines)
 
-        for index, theme in enumerate(themes, start=1):
-            if isinstance(theme, str):
-                blocks.append(_block(f"{index}. 主题", [theme]))
-                continue
-            title = simplify_summary_text((theme.get("title") or "主题")[:30])
-            paras = list(theme.get("paragraphs") or [])
-            examples = [str(e).strip() for e in (theme.get("examples") or []) if str(e).strip()]
+            blocks.append(block)
 
-            theme_block = [f"{index}. {title}", ""]
-            if examples:
-                tag_line = "  ".join(f"[{t}]" for t in examples[:6])
-                theme_block.append(tag_line)
-                theme_block.append("")
-            for para in paras[:3]:  # max 3 paragraphs per theme
-                para = para.strip()
-                if para:
-                    theme_block.extend(_para_lines(para))
-                    theme_block.append("")
-            blocks.append(theme_block[:-1] if theme_block and theme_block[-1] == "" else theme_block)
-
-    # ── Per-stock analysis (12 stocks max, capped per stock) ────────
-    stock_analyses = _coerce_list(llm_summary.get("stock_analyses"))
-    if stock_analyses:
-        blocks.append(["重点股票分析", ""])
-        for item in stock_analyses[:12]:
-            if isinstance(item, str):
-                blocks.append(["", *_para_lines(item)])
-                continue
-            ticker = (item.get("ticker") or "").strip()
-            analysis = (item.get("analysis") or "").strip()
-            if not ticker or not analysis:
-                continue
-            stock_block: list[str] = [f"◆ {ticker}", ""]
-            stock_block.extend(_para_lines(analysis))
-            blocks.append(stock_block)
-
-    # ── Market insights (15 bullets max) ────────────────────────────
-    insights = _coerce_list(llm_summary.get("market_insights"))
-    if insights:
-        blocks.append(_bullet_block("市场洞察", insights, max_items=15))
-
-    # ── Keywords (rows of 6, max 24) ─────────────────────────────────
+    # ── Keywords (rows of 6, max 24) ────────────────────────────────
     keywords = _coerce_list(llm_summary.get("keywords"))[:24]
     if keywords:
         kw_block = ["关键词", ""]
         row_size = 6
         for i in range(0, len(keywords), row_size):
-            kw_block.append("    ".join(keywords[i: i + row_size]))
+            kw_block.append("    ".join(str(k).strip() for k in keywords[i: i + row_size]))
         blocks.append(kw_block)
 
-    # ── Closing (3 paras max) ─────────────────────────────────────────
-    closing_paras = _coerce_list(llm_summary.get("closing_paragraphs"))
-    if closing_paras:
-        blocks.append(_block("最后的用法", closing_paras, max_paras=3))
-    elif not blocks:
+    if not blocks:
         blocks.append(["未能生成摘要。"])
 
     return blocks
+
+
+def render_summary_markdown(llm_summary: dict, video_title: str | None = None) -> str:
+    """Render the structured LLM summary as a markdown document.
+
+    Layout — section headings come from the LLM (executive_title / deep_dive_title),
+    so a chart-teaching video, a Q&A, and a market-analysis video each get titles
+    that match their actual content. Neutral fallbacks are used if the LLM omits
+    them.
+
+    Markdown preserves whatever script the LLM produced (no traditional/simplified
+    conversion) so quoted phrases stay readable.
+    """
+    parts: list[str] = []
+    if video_title:
+        parts.append(f"# {video_title.strip()}\n")
+
+    takeaway = (llm_summary.get("one_line_takeaway") or "").strip()
+    if takeaway:
+        parts.append(f"> {takeaway}\n")
+
+    exec_paragraphs = _coerce_list(llm_summary.get("executive_summary"))
+    exec_title = (llm_summary.get("executive_title") or "").strip() or "重点速览"
+    if exec_paragraphs:
+        parts.append(f"## {exec_title}\n")
+        for para in exec_paragraphs:
+            label, content = _split_labeled_para(para)
+            if not content and not label:
+                continue
+            if label and content:
+                parts.append(f"**{label}**：{content}\n")
+            elif label:
+                parts.append(f"**{label}**\n")
+            else:
+                parts.append(f"{content}\n")
+
+    outline = [str(item).strip() for item in _coerce_list(llm_summary.get("outline")) if str(item).strip()]
+    sections = _coerce_list(llm_summary.get("sections"))
+    deep_dive_title = (llm_summary.get("deep_dive_title") or "").strip() or "分主题展开"
+
+    if outline or sections:
+        if exec_paragraphs:
+            parts.append("\n———\n")
+        parts.append(f"## {deep_dive_title}\n")
+
+    if outline:
+        parts.append("**大纲：**\n")
+        for item in outline:
+            parts.append(f"- {item}")
+        parts.append("")
+
+    for s_idx, section in enumerate(sections, start=1):
+        if not isinstance(section, dict):
+            continue
+        title = (section.get("title") or "").strip() or f"主題 {s_idx}"
+        parts.append(f"\n### {s_idx}. {title}\n")
+        for point in _coerce_list(section.get("points")):
+            label, content = _split_labeled_para(point)
+            sub_points = _coerce_list(point.get("sub_points") if isinstance(point, dict) else None)
+
+            if label and content:
+                parts.append(f"**{label}：** {content}\n")
+            elif label:
+                parts.append(f"**{label}**\n")
+            elif content:
+                parts.append(f"{content}\n")
+
+            for sub in sub_points:
+                sub_label, sub_content = _split_labeled_para(sub)
+                if not sub_content and not sub_label:
+                    continue
+                if sub_label and sub_content:
+                    parts.append(f"- **{sub_label}：** {sub_content}")
+                elif sub_label:
+                    parts.append(f"- **{sub_label}**")
+                else:
+                    parts.append(f"- {sub_content}")
+            if sub_points:
+                parts.append("")
+
+    keywords = [str(k).strip() for k in _coerce_list(llm_summary.get("keywords")) if str(k).strip()]
+    if keywords:
+        parts.append("\n---\n")
+        parts.append("**关键词**：" + " ｜ ".join(keywords[:24]) + "\n")
+
+    return "\n".join(parts).rstrip() + "\n"
+
+
+HEADING_TITLES = {
+    "一句话总结",
+    "关键词",
+    # Template fallback headings (still emitted when LLM unavailable):
+    "核心结论",
+    "筛选框架",
+    "五个主题",
+    "核心主题",
+    "最后的用法",
+}
+
+SECTION_PREFIX_RE = re.compile(r"^[一二三四五六七八九十]+、")
 
 
 def line_style(line: str) -> str:
     simplified = simplify_summary_text(line).strip()
     if not simplified:
         return "Spacer"
-    if simplified in {"核心结论", "筛选框架", "五个主题", "核心主题", "最后的用法", "关键数据", "重点股票分析", "市场洞察", "一句话总结", "关键词"}:
+    if simplified in HEADING_TITLES:
+        return "Heading"
+    if SECTION_PREFIX_RE.match(simplified):
         return "Heading"
     if re.match(r"^\d+个主题$", simplified):
         return "Heading"
-    if re.match(r"^\d+\.\s", simplified):
+    if re.match(r"^\d+\.(\s|$)", simplified):
         return "Subheading"
+    if simplified.startswith("◆ "):
+        return "Subheading"
+    if simplified.startswith(("■ ", "◦ ")):
+        return "Subbullet"
     return "Body"
 
 
@@ -897,6 +1045,8 @@ def line_height(line: str) -> int:
         return 66
     if style == "Subheading":
         return 56
+    if style == "Subbullet":
+        return 50
     return 44
 
 
@@ -975,6 +1125,7 @@ Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour,
 Style: Title,{TITLE_FONT_NAME},74,&H002A2A2A,&H002A2A2A,&H00F8F6F1,&H00F8F6F1,1,0,0,0,100,100,0,0,1,0,0,7,{CONTENT_LEFT},82,120,1
 Style: Heading,{TITLE_FONT_NAME},48,&H002A2A2A,&H002A2A2A,&H00F8F6F1,&H00F8F6F1,1,0,0,0,100,100,0,0,1,0,0,7,{CONTENT_LEFT},82,260,1
 Style: Subheading,{TITLE_FONT_NAME},38,&H002A2A2A,&H002A2A2A,&H00F8F6F1,&H00F8F6F1,1,0,0,0,100,100,0,0,1,0,0,7,{CONTENT_LEFT},82,300,1
+Style: Subbullet,{TITLE_FONT_NAME},33,&H00424242,&H00424242,&H00F8F6F1,&H00F8F6F1,1,0,0,0,100,100,0,0,1,0,0,7,{CONTENT_LEFT},82,320,1
 Style: Body,{BODY_FONT_NAME},35,&H002A2A2A,&H002A2A2A,&H00F8F6F1,&H00F8F6F1,0,0,0,0,100,100,0,0,1,0,0,7,{CONTENT_LEFT},82,340,1
 Style: Spacer,{BODY_FONT_NAME},35,&H00F8F6F1,&H00F8F6F1,&H00F8F6F1,&H00F8F6F1,0,0,0,0,100,100,0,0,1,0,0,7,{CONTENT_LEFT},82,340,1
 
