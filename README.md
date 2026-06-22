@@ -20,6 +20,8 @@ The PDF summary is written next to it:
 ~/Downloads/<video-id>.subtitled.summary.pdf
 ```
 
+For Wistia iframe/media URLs, the script resolves the video to a direct MP4 rendition before downloading. This avoids slow HLS segment-by-segment downloads, which are especially painful on high-latency routes such as China.
+
 ## Already-downloaded MP4 → subtitled MP4
 
 Edit the `source`, `srt`, and `output` paths at the top of `burn_subs.py`, then run:
@@ -59,6 +61,14 @@ Use a faster model:
 ```bash
 /Users/welsnake/jlaw_video/.venv/bin/python /Users/welsnake/jlaw_video/wistia_srt.py "YOUR_WISTIA_URL" --model turbo
 ```
+
+Choose a lower Wistia video rendition for faster downloads:
+
+```bash
+/Users/welsnake/jlaw_video/.venv/bin/python /Users/welsnake/jlaw_video/wistia_srt.py "YOUR_WISTIA_URL" --wistia-height 720
+```
+
+By default, Wistia downloads use the highest available direct MP4 rendition to preserve the original clarity.
 
 Use a short clip for speed testing:
 

@@ -17,7 +17,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 from wistia_srt import (
     SubtitleSegment,
+    extract_wistia_media_id,
     fill_gaps,
+    resolve_wistia_mp4_url,
     sanitize_segments,
     timestamp,
     write_srt_from_segments,
@@ -347,6 +349,70 @@ def test_integration_srt_output():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Wistia resolver: direct MP4 avoids slow HLS segment downloads
+# ══════════════════════════════════════════════════════════════════════════════
+def test_wistia_resolver_selects_direct_mp4():
+    print("\n── Wistia resolver: iframe/media URL → direct MP4 ───────────────────────")
+
+    check("Iframe URL media id extracted",
+          extract_wistia_media_id("https://fast.wistia.net/embed/iframe/mroy9jmeg2") == "mroy9jmeg2")
+    check("Media playlist URL media id extracted",
+          extract_wistia_media_id("https://fast.wistia.net/embed/medias/mroy9jmeg2.m3u8") == "mroy9jmeg2")
+
+    import wistia_srt as _mod
+    original_fetch_json = _mod.fetch_json
+
+    def mock_fetch_json(url: str, timeout: float = 20.0) -> dict:
+        return {
+            "media": {
+                "assets": [
+                    {
+                        "display_name": "360p",
+                        "container": "mp4",
+                        "ext": "mp4",
+                        "height": 360,
+                        "width": 640,
+                        "size": 68_000_000,
+                        "url": "https://example.test/360.bin",
+                    },
+                    {
+                        "display_name": "540p",
+                        "container": "mp4",
+                        "ext": "mp4",
+                        "height": 540,
+                        "width": 960,
+                        "size": 99_000_000,
+                        "url": "https://example.test/540.bin",
+                    },
+                    {
+                        "display_name": "720p",
+                        "container": "mp4",
+                        "ext": "mp4",
+                        "height": 720,
+                        "width": 1280,
+                        "size": 130_000_000,
+                        "url": "https://example.test/720.bin",
+                    },
+                ]
+            }
+        }
+
+    _mod.fetch_json = mock_fetch_json
+    try:
+        default_resolved = resolve_wistia_mp4_url("https://fast.wistia.net/embed/iframe/mroy9jmeg2")
+        height_resolved = resolve_wistia_mp4_url("https://fast.wistia.net/embed/iframe/mroy9jmeg2", 540)
+    finally:
+        _mod.fetch_json = original_fetch_json
+
+    check("Default selects highest available direct MP4",
+          default_resolved == "https://example.test/720.bin",
+          f"got {default_resolved}")
+    check("Target height selects closest direct MP4",
+          height_resolved == "https://example.test/540.bin",
+          f"got {height_resolved}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Run all tests
 # ══════════════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
@@ -365,6 +431,7 @@ if __name__ == "__main__":
     test_fix3_no_gap_passthrough()
     test_fix3_failed_clip_graceful()
     test_integration_srt_output()
+    test_wistia_resolver_selects_direct_mp4()
 
     print("\n" + "=" * 70)
     passed = sum(1 for _, ok in _results if ok)

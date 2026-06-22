@@ -3,16 +3,19 @@ from __future__ import annotations
 
 import argparse
 import html
+import json
 import os
 import re
 import subprocess
 import sys
 import tempfile
+import textwrap
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.request import Request, urlopen
 
 from faster_whisper import WhisperModel
 from summary_pdf import build_summary_pdf
@@ -112,16 +115,93 @@ def safe_stem(url: str) -> str:
     return candidate or "wistia"
 
 
-def normalize_wistia_url(url: str) -> str:
+def extract_wistia_media_id(url: str) -> str | None:
     parsed = urlparse(url)
-    if parsed.netloc != "fast.wistia.net":
-        return url
+    if parsed.netloc.lower() not in {"fast.wistia.net", "fast.wistia.com"}:
+        return None
 
     match = re.match(r"^/embed/iframe/([A-Za-z0-9]+)$", parsed.path)
     if match:
-        return f"https://fast.wistia.net/embed/medias/{match.group(1)}.m3u8"
+        return match.group(1)
 
+    match = re.match(r"^/embed/medias/([A-Za-z0-9]+)(?:\.(?:m3u8|json))?$", parsed.path)
+    if match:
+        return match.group(1)
+
+    return None
+
+
+def normalize_wistia_url(url: str) -> str:
+    media_id = extract_wistia_media_id(url)
+    if media_id:
+        return f"https://fast.wistia.net/embed/medias/{media_id}.m3u8"
     return url
+
+
+def fetch_json(url: str, timeout: float = 20.0) -> dict:
+    request = Request(url, headers={"User-Agent": "jlaw-video/1.0"})
+    with urlopen(request, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def resolve_wistia_mp4_url(url: str, target_height: int | None = None) -> str:
+    """Resolve a Wistia iframe/media URL to a direct MP4 rendition.
+
+    The old HLS path works, but it can require hundreds of small segment requests.
+    That is especially painful on high-latency routes such as China -> Wistia CDN.
+    """
+    media_id = extract_wistia_media_id(url)
+    if not media_id:
+        return url
+
+    metadata_url = f"https://fast.wistia.net/embed/medias/{media_id}.json"
+    try:
+        metadata = fetch_json(metadata_url)
+    except Exception as exc:
+        fallback = normalize_wistia_url(url)
+        print(
+            f"Wistia metadata lookup failed ({exc}); falling back to HLS playlist: {fallback}",
+            flush=True,
+        )
+        return fallback
+
+    assets = metadata.get("media", {}).get("assets", [])
+    mp4_assets = [
+        asset for asset in assets
+        if asset.get("url") and (asset.get("container") == "mp4" or asset.get("ext") == "mp4")
+    ]
+    if not mp4_assets:
+        fallback = normalize_wistia_url(url)
+        print(f"No direct Wistia MP4 rendition found; falling back to HLS playlist: {fallback}", flush=True)
+        return fallback
+
+    if target_height is None:
+        selected = max(
+            mp4_assets,
+            key=lambda asset: (
+                int(asset.get("height") or 0),
+                int(asset.get("size") or 0),
+            ),
+        )
+    else:
+        target_height = max(1, target_height)
+        selected = min(
+            mp4_assets,
+            key=lambda asset: (
+                abs(int(asset.get("height") or 0) - target_height),
+                int(asset.get("size") or 0),
+            ),
+        )
+    height = selected.get("height") or "unknown"
+    width = selected.get("width") or "unknown"
+    size = int(selected.get("size") or 0)
+    size_label = f"{size / (1024 * 1024):.1f} MB" if size else "unknown size"
+    print(
+        f"Resolved Wistia media {media_id} to direct MP4 "
+        f"{width}x{height} ({selected.get('display_name')}, {size_label}).",
+        flush=True,
+    )
+    return selected["url"]
 
 
 def extract_google_drive_file_id(url: str) -> str | None:
@@ -967,6 +1047,13 @@ def parse_args() -> argparse.Namespace:
         help="Keep the downloaded source MP4, extracted audio, and generated SRT file.",
     )
     parser.add_argument(
+        "--wistia-height",
+        type=int,
+        default=None,
+        metavar="PX",
+        help="Preferred Wistia MP4 rendition height. Default: highest available direct MP4.",
+    )
+    parser.add_argument(
         "--start",
         help="Optional clip start time for short test runs, for example 00:01:00.",
     )
@@ -1027,8 +1114,10 @@ def main() -> int:
         print("ffmpeg is required but was not found in PATH.", file=sys.stderr)
         return 1
 
-    input_url = normalize_wistia_url(args.url)
-    stem = safe_stem(input_url)
+    stem = safe_stem(args.url)
+    input_url = args.url
+    if not is_google_drive_url(input_url):
+        input_url = resolve_wistia_mp4_url(input_url, args.wistia_height)
     default_output_dir = Path.home() / "Downloads"
     output_path = Path(args.output) if args.output else default_output_dir / f"{stem}.subtitled.mp4"
     source_path = output_path.with_name(f"{output_path.stem}.source.mp4")
