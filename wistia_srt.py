@@ -319,23 +319,53 @@ def download_youtube_video(url: str, destination: Path) -> None:
     if node:
         js_runtime_args = ["--js-runtimes", f"node:{node}"]
 
-    run(
-        [
+    attempts = [
+        (
+            "best available YouTube MP4",
+            "web_embedded",
+            "bv*[ext=mp4]+ba[ext=m4a]/bestvideo+bestaudio/best",
+        ),
+        (
+            "1080p H.264 YouTube MP4",
+            "web_embedded",
+            "bv*[height<=1080][vcodec^=avc1][ext=mp4]+ba[ext=m4a]/b[ext=mp4]/best",
+        ),
+        (
+            "360p compatible YouTube MP4",
+            "mweb",
+            "18/b[ext=mp4]/best",
+        ),
+    ]
+
+    last_error: subprocess.CalledProcessError | None = None
+    for label, client, fmt in attempts:
+        cmd = [
             *yt_dlp_command(),
             *js_runtime_args,
             "--remote-components",
             "ejs:github",
             "--extractor-args",
-            "youtube:player_client=mweb",
+            f"youtube:player_client={client}",
             "-f",
-            "18/b[ext=mp4]/best",
+            fmt,
             "--merge-output-format",
             "mp4",
             "-o",
             str(destination),
             url,
         ]
-    )
+        print(f"Trying {label}...", flush=True)
+        print("+", " ".join(cmd), flush=True)
+        completed = subprocess.run(cmd)
+        if completed.returncode == 0:
+            return
+        last_error = subprocess.CalledProcessError(completed.returncode, cmd)
+        for leftover in (destination, destination.with_name(f"{destination.name}.part")):
+            leftover.unlink(missing_ok=True)
+        print(f"YouTube download attempt failed ({label}); trying fallback...", flush=True)
+
+    if last_error:
+        raise last_error
 
 
 def ffmpeg_subtitles_arg(path: Path) -> str:
