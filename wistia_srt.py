@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import html
+import importlib.util
 import json
 import os
 import re
@@ -20,11 +21,7 @@ from urllib.request import Request, urlopen
 from faster_whisper import WhisperModel
 from summary_pdf import build_summary_pdf
 
-try:
-    import mlx_whisper as _mlx_whisper
-    _MLX_AVAILABLE = True
-except ImportError:
-    _MLX_AVAILABLE = False
+_MLX_AVAILABLE = importlib.util.find_spec("mlx_whisper") is not None
 
 try:
     import anthropic as _anthropic
@@ -95,19 +92,21 @@ def ffmpeg_escape(value: str) -> str:
     return value.replace("\\", "\\\\").replace(":", r"\:").replace("'", r"\'")
 
 
-def clip_args(start: str | None, duration: str | None) -> list[str]:
-    args: list[str] = []
-    if start:
-        args.extend(["-ss", start])
-    if duration:
-        args.extend(["-t", duration])
-    return args
+def clip_input_args(start: str | None) -> list[str]:
+    return ["-ss", start] if start else []
+
+
+def clip_output_args(duration: str | None) -> list[str]:
+    return ["-t", duration] if duration else []
 
 
 def safe_stem(url: str) -> str:
     google_drive_id = extract_google_drive_file_id(url)
     if google_drive_id:
         return google_drive_id
+    youtube_id = extract_youtube_video_id(url)
+    if youtube_id:
+        return youtube_id
     path = urlparse(url).path.rstrip("/")
     candidate = Path(path).name or "wistia"
     candidate = re.sub(r"\.[a-zA-Z0-9]+$", "", candidate)
@@ -269,6 +268,74 @@ def download_google_drive_file(url: str, destination: Path) -> None:
 
 def is_google_drive_url(url: str) -> bool:
     return extract_google_drive_file_id(url) is not None
+
+
+def extract_youtube_video_id(url: str) -> str | None:
+    parsed = urlparse(url)
+    host = parsed.netloc.lower()
+    if host.startswith("www."):
+        host = host[4:]
+    if host.startswith("m."):
+        host = host[2:]
+
+    if host == "youtu.be":
+        video_id = parsed.path.strip("/").split("/", 1)[0]
+        return video_id or None
+
+    if host not in {"youtube.com", "music.youtube.com"}:
+        return None
+
+    query = parse_qs(parsed.query)
+    values = query.get("v")
+    if values and values[0]:
+        return values[0]
+
+    match = re.match(r"^/(?:shorts|live|embed)/([^/?#]+)", parsed.path)
+    if match:
+        return match.group(1)
+
+    return None
+
+
+def is_youtube_url(url: str) -> bool:
+    return extract_youtube_video_id(url) is not None
+
+
+def yt_dlp_command() -> list[str]:
+    binary = shutil_which("yt-dlp")
+    if binary:
+        return [binary]
+    if importlib.util.find_spec("yt_dlp"):
+        return [sys.executable, "-m", "yt_dlp"]
+    raise RuntimeError(
+        "YouTube URLs require yt-dlp. Install it with: "
+        f"{sys.executable} -m pip install yt-dlp"
+    )
+
+
+def download_youtube_video(url: str, destination: Path) -> None:
+    js_runtime_args: list[str] = []
+    node = shutil_which("node")
+    if node:
+        js_runtime_args = ["--js-runtimes", f"node:{node}"]
+
+    run(
+        [
+            *yt_dlp_command(),
+            *js_runtime_args,
+            "--remote-components",
+            "ejs:github",
+            "--extractor-args",
+            "youtube:player_client=mweb",
+            "-f",
+            "18/b[ext=mp4]/best",
+            "--merge-output-format",
+            "mp4",
+            "-o",
+            str(destination),
+            url,
+        ]
+    )
 
 
 def ffmpeg_subtitles_arg(path: Path) -> str:
@@ -828,6 +895,8 @@ def _write_srt_mlx(
     verify: bool = True,
     traditional: bool = False,
 ) -> tuple[int, dict[str, float], list[SubtitleSegment], str | None]:
+    import mlx_whisper as _mlx_whisper
+
     print(f"Using mlx-whisper ({mlx_repo}) on Apple Silicon GPU", flush=True)
     load_started = time.monotonic()
     transcribe_kwargs: dict = {
@@ -1007,9 +1076,9 @@ def _write_srt_faster_whisper(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Download a Wistia or Google Drive video, transcribe or translate audio, and burn subtitles into a new MP4."
+        description="Download a Wistia, YouTube, or Google Drive video, transcribe or translate audio, and burn subtitles into a new MP4."
     )
-    parser.add_argument("url", help="Wistia or Google Drive video URL")
+    parser.add_argument("url", help="Wistia, YouTube, or Google Drive video URL")
     parser.add_argument(
         "-o",
         "--output",
@@ -1116,7 +1185,7 @@ def main() -> int:
 
     stem = safe_stem(args.url)
     input_url = args.url
-    if not is_google_drive_url(input_url):
+    if not is_google_drive_url(input_url) and not is_youtube_url(input_url):
         input_url = resolve_wistia_mp4_url(input_url, args.wistia_height)
     default_output_dir = Path.home() / "Downloads"
     output_path = Path(args.output) if args.output else default_output_dir / f"{stem}.subtitled.mp4"
@@ -1134,14 +1203,17 @@ def main() -> int:
         stage_started = time.monotonic()
         if is_google_drive_url(input_url):
             download_google_drive_file(input_url, source_path)
+        elif is_youtube_url(input_url):
+            download_youtube_video(input_url, source_path)
         else:
             run(
                 [
                     ffmpeg,
                     "-y",
+                    *clip_input_args(args.start),
                     "-i",
                     input_url,
-                    *clip_args(args.start, args.duration),
+                    *clip_output_args(args.duration),
                     "-c",
                     "copy",
                     str(source_path),
@@ -1149,16 +1221,17 @@ def main() -> int:
             )
         timings["download"] = time.monotonic() - stage_started
 
-        if is_google_drive_url(input_url) and (args.start or args.duration):
+        if (is_google_drive_url(input_url) or is_youtube_url(input_url)) and (args.start or args.duration):
             clipped_source_path = source_path.with_name(f"{source_path.stem}.clip.mp4")
             stage_started = time.monotonic()
             run(
                 [
                     ffmpeg,
                     "-y",
+                    *clip_input_args(args.start),
                     "-i",
                     str(source_path),
-                    *clip_args(args.start, args.duration),
+                    *clip_output_args(args.duration),
                     "-c",
                     "copy",
                     str(clipped_source_path),

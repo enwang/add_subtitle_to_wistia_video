@@ -17,6 +17,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 from wistia_srt import (
     SubtitleSegment,
+    extract_youtube_video_id,
     extract_wistia_media_id,
     fill_gaps,
     resolve_wistia_mp4_url,
@@ -413,6 +414,22 @@ def test_wistia_resolver_selects_direct_mp4():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# YouTube resolver: supported URL shapes share the same subtitle pipeline
+# ══════════════════════════════════════════════════════════════════════════════
+def test_youtube_video_id_extraction():
+    print("\n── YouTube resolver: URL → video id ─────────────────────────────────────")
+
+    check("Standard watch URL video id extracted",
+          extract_youtube_video_id("https://www.youtube.com/watch?is=9f-MWUHaQxVoAX8R&v=2-dKidjsu9I&feature=youtu.be") == "2-dKidjsu9I")
+    check("Short youtu.be URL video id extracted",
+          extract_youtube_video_id("https://youtu.be/2-dKidjsu9I") == "2-dKidjsu9I")
+    check("Shorts URL video id extracted",
+          extract_youtube_video_id("https://youtube.com/shorts/2-dKidjsu9I?feature=share") == "2-dKidjsu9I")
+    check("Non-YouTube URL ignored",
+          extract_youtube_video_id("https://fast.wistia.net/embed/iframe/mroy9jmeg2") is None)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Run all tests
 # ══════════════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
@@ -432,6 +449,7 @@ if __name__ == "__main__":
     test_fix3_failed_clip_graceful()
     test_integration_srt_output()
     test_wistia_resolver_selects_direct_mp4()
+    test_youtube_video_id_extraction()
 
     print("\n" + "=" * 70)
     passed = sum(1 for _, ok in _results if ok)
