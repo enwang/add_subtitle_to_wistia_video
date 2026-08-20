@@ -710,7 +710,68 @@ def is_hallucination(text: str) -> bool:
     # Whisper repetition loop: any CJK character (or any char) repeated 3+ times consecutively
     if re.search(r'(.)\1{2,}', text):
         return True
+    collapsed, changed = collapse_repetition_loops(text)
+    if changed and len(collapsed) <= max(12, len(text) * 0.75):
+        return True
     return False
+
+
+_REPETITION_SPLIT_RE = re.compile(r"([,，、;；。.!！?？\n]+)")
+_REPETITION_KEY_RE = re.compile(r"[\s,，、;；。.!！?？\"'“”‘’（）()【】\[\]{}<>《》]+")
+
+
+def _repetition_key(text: str) -> str:
+    return _REPETITION_KEY_RE.sub("", text).lower()
+
+
+def collapse_repetition_loops(text: str) -> tuple[str, bool]:
+    """Collapse Whisper phrase loops like '可能会是什么,可能会是什么,...'."""
+    pieces = _REPETITION_SPLIT_RE.split(text)
+    tokens: list[tuple[str, str]] = []
+    pending_sep = ""
+    for piece in pieces:
+        if not piece:
+            continue
+        if _REPETITION_SPLIT_RE.fullmatch(piece):
+            pending_sep += piece
+            continue
+        tokens.append((pending_sep, piece))
+        pending_sep = ""
+
+    if not tokens:
+        return text, False
+
+    result: list[tuple[str, str]] = []
+    changed = False
+    i = 0
+    while i < len(tokens):
+        sep, chunk = tokens[i]
+        key = _repetition_key(chunk)
+        j = i + 1
+        if len(key) >= 2:
+            while j < len(tokens) and _repetition_key(tokens[j][1]) == key:
+                j += 1
+        run_length = j - i
+        if run_length >= 3:
+            previous_key = _repetition_key(result[-1][1]) if result else ""
+            if not previous_key.endswith(key):
+                result.append((sep, chunk))
+            changed = True
+            i = j
+        else:
+            result.extend(tokens[i:j])
+            i = j
+
+    collapsed = "".join(sep + chunk for sep, chunk in result).strip()
+
+    # Also catch unseparated short phrase loops.
+    phrase_loop = re.compile(r"([^\s,，、;；。.!！?？]{2,16})(?:\1){2,}")
+    new_collapsed = phrase_loop.sub(r"\1", collapsed)
+    if new_collapsed != collapsed:
+        collapsed = new_collapsed
+        changed = True
+
+    return collapsed, changed
 
 
 def retranscribe_hallucinations(
@@ -813,6 +874,16 @@ def sanitize_segments(segments: list[SubtitleSegment]) -> list[SubtitleSegment]:
     cleaned: list[SubtitleSegment] = []
 
     for seg in segments:
+        collapsed_text, collapsed = collapse_repetition_loops(seg.text)
+        if collapsed:
+            issues.append(
+                f"phrase repetition loop at {timestamp(seg.start)}: "
+                f"collapsed {seg.text!r} to {collapsed_text!r}"
+            )
+            seg = SubtitleSegment(start=seg.start, end=seg.end, text=collapsed_text)
+        if not seg.text:
+            continue
+
         if not cleaned:
             cleaned.append(seg)
             continue
@@ -867,7 +938,7 @@ def strip_known_hallucinations(segments: list[SubtitleSegment]) -> list[Subtitle
     kept = []
     removed = 0
     for seg in segments:
-        if any(phrase in seg.text for phrase in _HALLUCINATION_SUBSTRINGS):
+        if is_hallucination(seg.text):
             print(f"  Hallucination filter: removed [{timestamp(seg.start)}] {seg.text!r}", flush=True)
             removed += 1
         else:

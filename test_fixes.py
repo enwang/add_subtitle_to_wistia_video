@@ -17,9 +17,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 from wistia_srt import (
     SubtitleSegment,
+    collapse_repetition_loops,
     extract_youtube_video_id,
     extract_wistia_media_id,
     fill_gaps,
+    is_hallucination,
     resolve_wistia_mp4_url,
     sanitize_segments,
     timestamp,
@@ -148,6 +150,38 @@ def test_fix1c_containment():
           cleaned2[0].text == "今天天氣很好")
     check("Start time kept from original first segment",
           cleaned2[0].start == 0.0)
+
+
+def test_fix1d_phrase_repetition_loop_collapsed():
+    print("\n── Fix 1d: Phrase repetition loop → collapsed before SRT ────────────────")
+
+    bad_text = (
+        "所以这些是旧息所导致的市场回报,一些很强势的股票,"
+        "这个机会有回报,不知道会不会是什么,但是可能会是什么,"
+        "可能会是什么,可能会是什么,可能会是什么,可能会是什么"
+    )
+    collapsed, changed = collapse_repetition_loops(bad_text)
+
+    check("Phrase loop detected",
+          changed)
+    check("Repeated tail collapsed to one copy",
+          collapsed.count("可能会是什么") == 1,
+          collapsed)
+    check("Useful prefix preserved",
+          "这个机会有回报" in collapsed)
+
+    cleaned = sanitize_segments([SubtitleSegment(start=0.0, end=8.0, text=bad_text)])
+    check("Sanitized segment remains usable after collapse",
+          len(cleaned) == 1 and cleaned[0].text == collapsed)
+
+
+def test_fix1e_phrase_repetition_loop_is_hallucination():
+    print("\n── Fix 1e: Phrase repetition loop → hallucination signal ────────────────")
+
+    check("Repeated phrase is flagged",
+          is_hallucination("可能会是什么,可能会是什么,可能会是什么,可能会是什么"))
+    check("Natural repeated finance wording is preserved",
+          not is_hallucination("这个位置可能会有反弹, 但需要等确认, 可能会有机会"))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -442,6 +476,8 @@ if __name__ == "__main__":
     test_fix1_no_false_positives()
     test_fix1b_overlap()
     test_fix1c_containment()
+    test_fix1d_phrase_repetition_loop_collapsed()
+    test_fix1e_phrase_repetition_loop_is_hallucination()
     test_fix2_condition_on_previous_text_param()
     test_fix3_gap_detected_and_filled()
     test_fix3_leading_gap_filled()
