@@ -14,6 +14,13 @@ The same command also accepts YouTube URLs:
 /Users/welsnake/jlaw_video/.venv/bin/python /Users/welsnake/jlaw_video/wistia_srt.py "https://www.youtube.com/watch?v=VIDEO_ID"
 ```
 
+It also accepts Google Drive file URLs and local video files:
+
+```bash
+/Users/welsnake/jlaw_video/.venv/bin/python /Users/welsnake/jlaw_video/wistia_srt.py "https://drive.google.com/file/d/FILE_ID/view"
+/Users/welsnake/jlaw_video/.venv/bin/python /Users/welsnake/jlaw_video/wistia_srt.py ~/Downloads/video.mp4
+```
+
 The default output file is written to:
 
 ```bash
@@ -33,6 +40,33 @@ For YouTube URLs, the script uses `yt-dlp` to download an MP4 source before runn
 ```bash
 /Users/welsnake/jlaw_video/.venv/bin/python -m pip install yt-dlp
 ```
+
+For private Google Drive files, the most durable setup is Google Drive OAuth. Install the optional dependencies:
+
+```bash
+/Users/welsnake/jlaw_video/.venv/bin/python -m pip install google-api-python-client google-auth-oauthlib google-auth-httplib2
+```
+
+Create a Google OAuth Desktop client, download its `client_secret_*.json`, and save it here:
+
+```bash
+mkdir -p ~/.config/jlaw_video
+cp ~/Downloads/client_secret_*.json ~/.config/jlaw_video/google_drive_client_secret.json
+```
+
+Then run the normal command. The first run opens a browser authorization page and stores a reusable token at `~/.cache/jlaw_video/google_drive_token.json`; later private Drive links download through the Drive API automatically:
+
+```bash
+/Users/welsnake/jlaw_video/.venv/bin/python /Users/welsnake/jlaw_video/wistia_srt.py "https://drive.google.com/file/d/FILE_ID/view" --summary-pdf
+```
+
+You can also pass a client file explicitly:
+
+```bash
+/Users/welsnake/jlaw_video/.venv/bin/python /Users/welsnake/jlaw_video/wistia_srt.py "https://drive.google.com/file/d/FILE_ID/view" --drive-oauth-client ~/Downloads/client_secret.json
+```
+
+Without OAuth, the script still tries direct Drive download, the large-file virus-warning confirm URL, Chrome cookies through `yt-dlp`, and finally any local Drive cache. Some Google Vids or embedded-player files can reject non-OAuth direct download even when they play in the browser.
 
 ## Already-downloaded MP4 → subtitled MP4
 

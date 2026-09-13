@@ -18,10 +18,14 @@ sys.path.insert(0, str(Path(__file__).parent))
 from wistia_srt import (
     SubtitleSegment,
     collapse_repetition_loops,
+    download_google_drive_file,
     extract_youtube_video_id,
     extract_wistia_media_id,
     fill_gaps,
     is_hallucination,
+    normalize_input_url,
+    resolve_google_drive_virus_warning_url,
+    resolve_google_drive_download_url,
     resolve_wistia_mp4_url,
     sanitize_segments,
     timestamp,
@@ -463,6 +467,262 @@ def test_youtube_video_id_extraction():
           extract_youtube_video_id("https://fast.wistia.net/embed/iframe/mroy9jmeg2") is None)
 
 
+def test_input_url_normalization():
+    print("\n── Input URL normalization: markdown links and escapes ──────────────────")
+
+    markdown = "[https://drive.google.com/file/d/1SYKC3ZjpwtOSCWXYcBKf9W8NlnD-\\_aMy/view](https://drive.google.com/file/d/1SYKC3ZjpwtOSCWXYcBKf9W8NlnD-_aMy/view)"
+    normalized = normalize_input_url(markdown)
+    check("Markdown link unwraps to target URL",
+          normalized == "https://drive.google.com/file/d/1SYKC3ZjpwtOSCWXYcBKf9W8NlnD-_aMy/view",
+          normalized)
+    check("Escaped underscore is restored",
+          normalize_input_url("https://example.com/a\\_b") == "https://example.com/a_b")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Google Drive resolver: private files fail early with a useful message
+# ══════════════════════════════════════════════════════════════════════════════
+def test_google_drive_private_file_error():
+    print("\n── Google Drive resolver: private file → clear permission error ─────────")
+
+    import subprocess
+    import wistia_srt as _mod
+    original_check_output = _mod.subprocess.check_output
+
+    def mock_check_output(cmd, text=True):
+        return '<html><head><base href="https://accounts.google.com/v3/signin/"></head></html>'
+
+    _mod.subprocess.check_output = mock_check_output
+    try:
+        try:
+            resolve_google_drive_download_url("https://drive.google.com/file/d/1SYKC3ZjpwtOSCWXYcBKf9W8NlnD-_aMy/view")
+        except PermissionError as exc:
+            message = str(exc)
+            check("Private Drive file raises PermissionError", True)
+            check("Error explains sharing requirement",
+                  "Anyone with the link" in message and "1SYKC3ZjpwtOSCWXYcBKf9W8NlnD-_aMy" in message,
+                  message)
+        except Exception as exc:
+            check("Private Drive file raises PermissionError", False, type(exc).__name__)
+        else:
+            check("Private Drive file raises PermissionError", False, "no exception")
+    finally:
+        _mod.subprocess.check_output = original_check_output
+
+
+def test_google_drive_private_file_uses_chrome_cookie_fallback():
+    print("\n── Google Drive resolver: private file → Chrome cookie fallback ─────────")
+
+    import wistia_srt as _mod
+    original_oauth_client_path = _mod.google_drive_oauth_client_path
+    original_resolve = _mod.resolve_google_drive_download_url
+    original_cookie_download = _mod.download_google_drive_with_browser_cookies
+
+    calls: list[tuple[str, Path, str]] = []
+
+    def mock_oauth_client_path(explicit_path=None):
+        return None
+
+    def mock_resolve(url: str) -> str:
+        raise PermissionError("private")
+
+    def mock_cookie_download(url: str, destination: Path, browser: str = "chrome") -> None:
+        calls.append((browser, destination, url))
+        destination.write_bytes(b"\x00\x00\x00\x18ftypmp42")
+
+    _mod.google_drive_oauth_client_path = mock_oauth_client_path
+    _mod.resolve_google_drive_download_url = mock_resolve
+    _mod.download_google_drive_with_browser_cookies = mock_cookie_download
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+        dest = Path(tmp.name)
+    dest.unlink(missing_ok=True)
+    try:
+        download_google_drive_file("https://drive.google.com/file/d/1SYKC3ZjpwtOSCWXYcBKf9W8NlnD-_aMy/view", dest)
+        check("Chrome cookie fallback was called",
+              len(calls) == 1 and calls[0][0] == "chrome")
+        check("Fallback output was accepted as non-HTML video-like file",
+              dest.exists() and dest.stat().st_size > 0)
+    finally:
+        dest.unlink(missing_ok=True)
+        _mod.google_drive_oauth_client_path = original_oauth_client_path
+        _mod.resolve_google_drive_download_url = original_resolve
+        _mod.download_google_drive_with_browser_cookies = original_cookie_download
+
+
+def test_google_drive_cookie_fallback_normalizes_markdown_url():
+    print("\n── Google Drive resolver: cookie fallback normalizes input URL ──────────")
+
+    import wistia_srt as _mod
+    original_yt_dlp_command = _mod.yt_dlp_command
+    original_run = _mod.run
+
+    captured: list[list[str]] = []
+
+    def mock_yt_dlp_command() -> list[str]:
+        return ["yt-dlp"]
+
+    def mock_run(cmd: list[str]) -> None:
+        captured.append(cmd)
+
+    _mod.yt_dlp_command = mock_yt_dlp_command
+    _mod.run = mock_run
+    try:
+        _mod.download_google_drive_with_browser_cookies(
+            "[https://drive.google.com/file/d/1\\_hp\\_IhRp3YOfufdzIuSUlmoV4F1of\\_Ir/view](https://drive.google.com/file/d/1_hp_IhRp3YOfufdzIuSUlmoV4F1of_Ir/view)",
+            Path("/tmp/out.mp4"),
+        )
+        check("yt-dlp receives pure URL after normalization",
+              captured and captured[0][-1] == "https://drive.google.com/file/d/1_hp_IhRp3YOfufdzIuSUlmoV4F1of_Ir/view",
+              str(captured[0] if captured else []))
+    finally:
+        _mod.yt_dlp_command = original_yt_dlp_command
+        _mod.run = original_run
+
+
+def test_google_drive_cached_file_fallback():
+    print("\n── Google Drive resolver: cached local file fallback ────────────────────")
+
+    import wistia_srt as _mod
+    original_cache_path = _mod._DRIVE_CACHE_PATH
+    original_oauth_client_path = _mod.google_drive_oauth_client_path
+    original_resolve = _mod.resolve_google_drive_download_url
+    original_cookie_download = _mod.download_google_drive_with_browser_cookies
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir_path = Path(tmpdir)
+        cached = tmpdir_path / "cached.mov"
+        cached.write_bytes(b"\x00\x00\x00\x18ftypmp42")
+        cache_path = tmpdir_path / "drive_cache.json"
+        cache_path.write_text(
+            '{"file123": "' + str(cached).replace("\\", "\\\\") + '"}',
+            encoding="utf-8",
+        )
+        dest = tmpdir_path / "dest.mp4"
+
+        def mock_resolve(url: str) -> str:
+            raise AssertionError("network should not be used when cache exists")
+
+        def mock_oauth_client_path(explicit_path=None):
+            return None
+
+        def mock_cookie_download(url: str, destination: Path, browser: str = "chrome") -> None:
+            raise AssertionError("cookie fallback should not be used when cache exists")
+
+        _mod._DRIVE_CACHE_PATH = cache_path
+        _mod.google_drive_oauth_client_path = mock_oauth_client_path
+        _mod.resolve_google_drive_download_url = mock_resolve
+        _mod.download_google_drive_with_browser_cookies = mock_cookie_download
+        try:
+            download_google_drive_file("https://drive.google.com/file/d/file123/view", dest)
+            check("Cached Drive file copied to destination",
+                  dest.exists() and dest.read_bytes() == cached.read_bytes())
+        finally:
+            _mod._DRIVE_CACHE_PATH = original_cache_path
+            _mod.google_drive_oauth_client_path = original_oauth_client_path
+            _mod.resolve_google_drive_download_url = original_resolve
+            _mod.download_google_drive_with_browser_cookies = original_cookie_download
+
+
+def test_google_drive_oauth_preferred_when_configured():
+    print("\n── Google Drive resolver: OAuth preferred when configured ───────────────")
+
+    import wistia_srt as _mod
+    original_oauth_client_path = _mod.google_drive_oauth_client_path
+    original_oauth_download = _mod.download_google_drive_with_oauth
+    original_cache = _mod.copy_cached_google_drive_file
+    original_resolve = _mod.resolve_google_drive_download_url
+
+    calls: list[tuple[str, Path, Path]] = []
+
+    def mock_oauth_client_path(explicit_path=None):
+        return Path("/tmp/client_secret.json")
+
+    def mock_oauth_download(file_id: str, destination: Path, client_secret_path: Path) -> None:
+        calls.append((file_id, destination, client_secret_path))
+        destination.write_bytes(b"\x00\x00\x00\x18ftypmp42")
+
+    def fail_cache(file_id: str, destination: Path) -> bool:
+        raise AssertionError("cache should not run before OAuth")
+
+    def fail_resolve(url: str) -> str:
+        raise AssertionError("direct resolver should not run before OAuth")
+
+    _mod.google_drive_oauth_client_path = mock_oauth_client_path
+    _mod.download_google_drive_with_oauth = mock_oauth_download
+    _mod.copy_cached_google_drive_file = fail_cache
+    _mod.resolve_google_drive_download_url = fail_resolve
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+        dest = Path(tmp.name)
+    dest.unlink(missing_ok=True)
+    try:
+        download_google_drive_file("https://drive.google.com/file/d/file123/view", dest)
+        check("OAuth download was used",
+              len(calls) == 1 and calls[0][0] == "file123")
+        check("OAuth output accepted",
+              dest.exists() and dest.stat().st_size > 0)
+    finally:
+        dest.unlink(missing_ok=True)
+        _mod.google_drive_oauth_client_path = original_oauth_client_path
+        _mod.download_google_drive_with_oauth = original_oauth_download
+        _mod.copy_cached_google_drive_file = original_cache
+        _mod.resolve_google_drive_download_url = original_resolve
+
+
+def test_google_drive_virus_warning_resolves_confirm_url():
+    print("\n── Google Drive resolver: virus warning → confirm download URL ──────────")
+
+    import wistia_srt as _mod
+    original_check_output = _mod.subprocess.check_output
+
+    warning_html = """
+    <html><body>
+      <p>Google Drive can't scan this file for viruses.</p>
+      <p>Would you still like to download this file?</p>
+      <form action="https://drive.usercontent.google.com/download" method="get">
+        <input type="hidden" name="id" value="1_hp_IhRp3YOfufdzIuSUlmoV4F1of_Ir">
+        <input type="hidden" name="export" value="download">
+        <input type="hidden" name="confirm" value="t">
+        <input type="hidden" name="uuid" value="abc123">
+      </form>
+      <button id="uc-download-link">Download anyway</button>
+    </body></html>
+    """
+
+    def mock_check_output(cmd, text=True):
+        return warning_html
+
+    _mod.subprocess.check_output = mock_check_output
+    try:
+        resolved = resolve_google_drive_download_url("https://drive.google.com/file/d/1_hp_IhRp3YOfufdzIuSUlmoV4F1of_Ir/view")
+        check("Virus warning resolves to usercontent download endpoint",
+              resolved.startswith("https://drive.usercontent.google.com/download?"),
+              resolved)
+        check("Confirm token preserved",
+              "confirm=t" in resolved and "uuid=abc123" in resolved,
+              resolved)
+    finally:
+        _mod.subprocess.check_output = original_check_output
+
+
+def test_google_drive_virus_warning_link_fallback():
+    print("\n── Google Drive resolver: virus warning link fallback ───────────────────")
+
+    html = """
+    <html><body>
+      Google Drive can't scan this file for viruses.
+      <a id="uc-download-link" href="/download?id=file123&export=download&confirm=t">Download anyway</a>
+    </body></html>
+    """
+    resolved = resolve_google_drive_virus_warning_url(
+        html,
+        "https://drive.usercontent.google.com/download?id=file123&export=download",
+        "file123",
+    )
+    check("Virus warning link fallback resolves relative URL",
+          resolved == "https://drive.usercontent.google.com/download?id=file123&export=download&confirm=t",
+          str(resolved))
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Run all tests
 # ══════════════════════════════════════════════════════════════════════════════
@@ -486,6 +746,14 @@ if __name__ == "__main__":
     test_integration_srt_output()
     test_wistia_resolver_selects_direct_mp4()
     test_youtube_video_id_extraction()
+    test_input_url_normalization()
+    test_google_drive_private_file_error()
+    test_google_drive_private_file_uses_chrome_cookie_fallback()
+    test_google_drive_cookie_fallback_normalizes_markdown_url()
+    test_google_drive_cached_file_fallback()
+    test_google_drive_oauth_preferred_when_configured()
+    test_google_drive_virus_warning_resolves_confirm_url()
+    test_google_drive_virus_warning_link_fallback()
 
     print("\n" + "=" * 70)
     passed = sum(1 for _, ok in _results if ok)

@@ -7,6 +7,7 @@ import importlib.util
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -15,7 +16,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
-from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.parse import parse_qs, urlencode, urljoin, urlparse
 from urllib.request import Request, urlopen
 
 from faster_whisper import WhisperModel
@@ -31,6 +32,10 @@ except ImportError:
 
 # Primer sentence in simplified Chinese — biases Whisper toward simplified characters
 _SIMPLIFIED_CHINESE_PROMPT = "以下是普通话或粤语财经视频的字幕内容。"
+_DRIVE_CACHE_PATH = Path.home() / ".cache" / "jlaw_video" / "drive_cache.json"
+_DRIVE_OAUTH_TOKEN_PATH = Path.home() / ".cache" / "jlaw_video" / "google_drive_token.json"
+_DRIVE_OAUTH_CLIENT_PATH = Path.home() / ".config" / "jlaw_video" / "google_drive_client_secret.json"
+_DRIVE_OAUTH_SCOPE = ["https://www.googleapis.com/auth/drive.readonly"]
 
 # Load .env from the same directory as this script
 _env_path = Path(__file__).parent / ".env"
@@ -100,7 +105,16 @@ def clip_output_args(duration: str | None) -> list[str]:
     return ["-t", duration] if duration else []
 
 
+def normalize_input_url(value: str) -> str:
+    candidate = value.strip()
+    markdown_match = re.fullmatch(r"\[([^\]]+)\]\(([^)]+)\)", candidate)
+    if markdown_match:
+        candidate = markdown_match.group(2)
+    return candidate.replace(r"\_", "_")
+
+
 def safe_stem(url: str) -> str:
+    url = normalize_input_url(url)
     google_drive_id = extract_google_drive_file_id(url)
     if google_drive_id:
         return google_drive_id
@@ -231,6 +245,55 @@ def parse_hidden_inputs(html_body: str) -> dict[str, str]:
     return fields
 
 
+def is_google_drive_signin_page(response: str) -> bool:
+    markers = (
+        "accounts.google.com",
+        "ServiceLogin",
+        "signin/identifier",
+        "Google Accounts",
+    )
+    return any(marker in response for marker in markers)
+
+
+def is_google_drive_virus_warning_page(response: str) -> bool:
+    markers = (
+        "Google Drive can't scan this file for viruses",
+        "Download anyway",
+        "too large for Google to scan for viruses",
+        "uc-download-link",
+    )
+    return any(marker in response for marker in markers)
+
+
+def raise_google_drive_permission_error(file_id: str) -> None:
+    raise PermissionError(
+        "Google Drive file requires sign-in or is not shared publicly. "
+        "Open the file in Google Drive, choose Share, set General access to "
+        "'Anyone with the link' as Viewer, then rerun this command. "
+        f"File id: {file_id}"
+    )
+
+
+def resolve_google_drive_virus_warning_url(response: str, current_url: str, file_id: str) -> str | None:
+    form_match = re.search(r'<form[^>]+action="([^"]+)"', response, flags=re.IGNORECASE)
+    if form_match:
+        action = html.unescape(form_match.group(1))
+        params = parse_hidden_inputs(response)
+        params.setdefault("id", file_id)
+        params.setdefault("export", "download")
+        return f"{urljoin(current_url, action)}?{urlencode(params)}"
+
+    link_match = re.search(
+        r'<a[^>]+id="uc-download-link"[^>]+href="([^"]+)"',
+        response,
+        flags=re.IGNORECASE,
+    )
+    if link_match:
+        return urljoin(current_url, html.unescape(link_match.group(1)))
+
+    return None
+
+
 def resolve_google_drive_download_url(url: str) -> str | None:
     file_id = extract_google_drive_file_id(url)
     if not file_id:
@@ -238,6 +301,12 @@ def resolve_google_drive_download_url(url: str) -> str | None:
 
     probe_url = f"https://drive.google.com/uc?export=download&id={file_id}"
     response = subprocess.check_output(["curl", "-fsSL", probe_url], text=True)
+    if is_google_drive_signin_page(response):
+        raise_google_drive_permission_error(file_id)
+    if is_google_drive_virus_warning_page(response):
+        warning_url = resolve_google_drive_virus_warning_url(response, probe_url, file_id)
+        if warning_url:
+            return warning_url
 
     form_match = re.search(r'<form[^>]+action="([^"]+/download)"', response, flags=re.IGNORECASE)
     if form_match:
@@ -259,11 +328,193 @@ def resolve_google_drive_download_url(url: str) -> str | None:
     return probe_url
 
 
-def download_google_drive_file(url: str, destination: Path) -> None:
-    resolved = resolve_google_drive_download_url(url)
-    if not resolved:
-        raise ValueError("Could not resolve Google Drive download URL.")
-    run(["curl", "-fL", resolved, "-o", str(destination)])
+def validate_downloaded_google_drive_file(path: Path, file_id: str) -> None:
+    if not path.exists() or path.stat().st_size == 0:
+        raise ValueError(f"Google Drive download produced an empty file. File id: {file_id}")
+
+    head = path.read_bytes()[:4096]
+    text_head = head.decode("utf-8", errors="ignore")
+    lower_head = text_head.lower()
+    if "<!doctype html" in lower_head or "<html" in lower_head:
+        if is_google_drive_signin_page(text_head):
+            raise_google_drive_permission_error(file_id)
+        if is_google_drive_virus_warning_page(text_head):
+            raise ValueError(
+                "Google Drive download stopped at the virus scan warning page instead of the video file. "
+                "The script tried to auto-confirm the warning but Google did not return the file. "
+                f"File id: {file_id}"
+            )
+        raise ValueError(
+            "Google Drive download returned an HTML page instead of a video file. "
+            "Check that the file is shared as 'Anyone with the link' and is directly downloadable. "
+            f"File id: {file_id}"
+        )
+
+
+def load_google_drive_cache() -> dict[str, str]:
+    try:
+        return json.loads(_DRIVE_CACHE_PATH.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except Exception as exc:
+        print(f"Warning: could not read Drive cache {_DRIVE_CACHE_PATH}: {exc}", flush=True)
+        return {}
+
+
+def cached_google_drive_file(file_id: str) -> Path | None:
+    cached = load_google_drive_cache().get(file_id)
+    if not cached:
+        return None
+    path = Path(cached).expanduser()
+    if path.exists() and path.is_file():
+        return path
+    print(f"Drive cache entry for {file_id} no longer exists: {path}", flush=True)
+    return None
+
+
+def copy_cached_google_drive_file(file_id: str, destination: Path) -> bool:
+    cached = cached_google_drive_file(file_id)
+    if not cached:
+        return False
+    print(f"Using cached Google Drive download: {cached}", flush=True)
+    shutil.copy2(cached, destination)
+    validate_downloaded_google_drive_file(destination, file_id)
+    return True
+
+
+def google_drive_oauth_client_path(explicit_path: str | None = None) -> Path | None:
+    candidates = [
+        explicit_path,
+        os.environ.get("GOOGLE_DRIVE_OAUTH_CLIENT_SECRETS"),
+        str(_DRIVE_OAUTH_CLIENT_PATH),
+    ]
+    for candidate in candidates:
+        if not candidate:
+            continue
+        path = Path(candidate).expanduser()
+        if path.exists():
+            return path
+    return None
+
+
+def google_drive_oauth_dependencies():
+    try:
+        from google.auth.transport.requests import Request as GoogleAuthRequest
+        from google.oauth2.credentials import Credentials
+        from google_auth_oauthlib.flow import InstalledAppFlow
+        from googleapiclient.discovery import build
+        from googleapiclient.http import MediaIoBaseDownload
+    except ImportError as exc:
+        raise RuntimeError(
+            "Google Drive OAuth download requires optional dependencies. Install them with: "
+            f"{sys.executable} -m pip install google-api-python-client google-auth-oauthlib google-auth-httplib2"
+        ) from exc
+    return GoogleAuthRequest, Credentials, InstalledAppFlow, build, MediaIoBaseDownload
+
+
+def download_google_drive_with_oauth(
+    file_id: str,
+    destination: Path,
+    client_secret_path: Path,
+) -> None:
+    GoogleAuthRequest, Credentials, InstalledAppFlow, build, MediaIoBaseDownload = google_drive_oauth_dependencies()
+
+    creds = None
+    if _DRIVE_OAUTH_TOKEN_PATH.exists():
+        creds = Credentials.from_authorized_user_file(str(_DRIVE_OAUTH_TOKEN_PATH), _DRIVE_OAUTH_SCOPE)
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(GoogleAuthRequest())
+        else:
+            flow = InstalledAppFlow.from_client_secrets_file(str(client_secret_path), _DRIVE_OAUTH_SCOPE)
+            creds = flow.run_local_server(port=0)
+        _DRIVE_OAUTH_TOKEN_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _DRIVE_OAUTH_TOKEN_PATH.write_text(creds.to_json(), encoding="utf-8")
+
+    service = build("drive", "v3", credentials=creds)
+    metadata = service.files().get(fileId=file_id, fields="name,mimeType,size").execute()
+    name = metadata.get("name") or file_id
+    size = metadata.get("size")
+    size_label = f", {int(size) / (1024 * 1024):.1f} MB" if size and str(size).isdigit() else ""
+    print(f"Downloading Google Drive file via OAuth: {name}{size_label}", flush=True)
+
+    request = service.files().get_media(fileId=file_id)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with destination.open("wb") as handle:
+        downloader = MediaIoBaseDownload(handle, request, chunksize=16 * 1024 * 1024)
+        done = False
+        last_percent = -1
+        while not done:
+            status, done = downloader.next_chunk()
+            if status:
+                percent = int(status.progress() * 100)
+                if percent != last_percent and (percent == 100 or percent - last_percent >= 5):
+                    print(f"Google Drive OAuth download: {percent}%", flush=True)
+                    last_percent = percent
+    validate_downloaded_google_drive_file(destination, file_id)
+
+
+def download_google_drive_with_browser_cookies(
+    url: str,
+    destination: Path,
+    browser: str = "chrome",
+) -> None:
+    url = normalize_input_url(url)
+    cmd = [
+        *yt_dlp_command(),
+        "--cookies-from-browser",
+        browser,
+        "-o",
+        str(destination),
+        url,
+    ]
+    print(f"Trying Google Drive download with {browser} browser cookies...", flush=True)
+    run(cmd)
+
+
+def download_google_drive_file(
+    url: str,
+    destination: Path,
+    oauth_client_path: str | None = None,
+    use_cache: bool = True,
+) -> None:
+    url = normalize_input_url(url)
+    file_id = extract_google_drive_file_id(url)
+    if not file_id:
+        raise ValueError("Could not extract Google Drive file id.")
+    oauth_path = google_drive_oauth_client_path(oauth_client_path)
+    if oauth_path:
+        try:
+            download_google_drive_with_oauth(file_id, destination, oauth_path)
+            return
+        except Exception as exc:
+            print(f"Google Drive OAuth download failed ({exc}); trying non-OAuth fallbacks.", flush=True)
+
+    if use_cache and copy_cached_google_drive_file(file_id, destination):
+        return
+    try:
+        resolved = resolve_google_drive_download_url(url)
+        if not resolved:
+            raise ValueError("Could not resolve Google Drive download URL.")
+        run(["curl", "-fL", resolved, "-o", str(destination)])
+        validate_downloaded_google_drive_file(destination, file_id)
+    except PermissionError as exc:
+        print(f"{exc}", flush=True)
+        print("Falling back to your local Chrome login cookies.", flush=True)
+        try:
+            download_google_drive_with_browser_cookies(url, destination)
+            validate_downloaded_google_drive_file(destination, file_id)
+        except Exception as cookie_exc:
+            if use_cache and copy_cached_google_drive_file(file_id, destination):
+                return
+            raise PermissionError(
+                "Google Drive download still failed after trying Chrome browser cookies. "
+                "Chrome cookies were readable, but Google may still reject the file with 403 "
+                "if the Chrome account cannot view it or Drive blocks direct download. "
+                "Make sure Chrome is signed in to the Google account that can open this exact file, "
+                "or share the file as 'Anyone with the link' / download it locally first. "
+                f"Original error: {exc}. Cookie fallback error: {cookie_exc}"
+            ) from cookie_exc
 
 
 def is_google_drive_url(url: str) -> bool:
@@ -1224,6 +1475,18 @@ def parse_args() -> argparse.Namespace:
         help="Preferred Wistia MP4 rendition height. Default: highest available direct MP4.",
     )
     parser.add_argument(
+        "--drive-oauth-client",
+        help=(
+            "Path to a Google OAuth client_secret JSON for durable private Drive downloads. "
+            f"Default: GOOGLE_DRIVE_OAUTH_CLIENT_SECRETS or {_DRIVE_OAUTH_CLIENT_PATH}"
+        ),
+    )
+    parser.add_argument(
+        "--no-drive-cache",
+        action="store_true",
+        help="Do not reuse locally cached Google Drive downloads.",
+    )
+    parser.add_argument(
         "--start",
         help="Optional clip start time for short test runs, for example 00:01:00.",
     )
@@ -1278,6 +1541,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    args.url = normalize_input_url(args.url)
 
     ffmpeg = ffmpeg_binary()
     if not ffmpeg:
@@ -1303,7 +1567,12 @@ def main() -> int:
     try:
         stage_started = time.monotonic()
         if is_google_drive_url(input_url):
-            download_google_drive_file(input_url, source_path)
+            download_google_drive_file(
+                input_url,
+                source_path,
+                oauth_client_path=args.drive_oauth_client,
+                use_cache=not args.no_drive_cache,
+            )
         elif is_youtube_url(input_url):
             download_youtube_video(input_url, source_path)
         else:
