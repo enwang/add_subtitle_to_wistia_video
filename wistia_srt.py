@@ -637,6 +637,24 @@ def ffmpeg_subtitles_arg(path: Path) -> str:
     return f"subtitles=filename='{raw}':force_style='{style}'"
 
 
+def ffmpeg_subtitle_video_filter(
+    srt_path: Path,
+    cover_existing_subtitles: bool = False,
+    subtitle_cover_height: float = 0.30,
+) -> str:
+    subtitle_filter = ffmpeg_subtitles_arg(srt_path)
+    if not cover_existing_subtitles:
+        return subtitle_filter
+
+    cover_height = min(max(subtitle_cover_height, 0.05), 0.60)
+    cover_y = 1.0 - cover_height
+    cover_filter = (
+        f"drawbox=x=0:y=ih*{cover_y:.4f}:w=iw:h=ih*{cover_height:.4f}:"
+        "color=black@1:t=fill"
+    )
+    return f"{cover_filter},{subtitle_filter}"
+
+
 def media_duration_seconds(path: Path) -> float | None:
     ffprobe = ffprobe_binary()
     if not ffprobe:
@@ -1536,6 +1554,24 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Output traditional Chinese characters instead of simplified. Default: simplified Chinese.",
     )
+    parser.add_argument(
+        "--cover-existing-subtitles",
+        action="store_true",
+        help=(
+            "Cover hard-burned subtitles already present near the bottom of the source video "
+            "before burning the newly generated subtitles."
+        ),
+    )
+    parser.add_argument(
+        "--subtitle-cover-height",
+        type=float,
+        default=0.30,
+        metavar="RATIO",
+        help=(
+            "Bottom-of-frame height to cover when --cover-existing-subtitles is enabled. "
+            "Use a ratio from 0.05 to 0.60. Default: 0.30"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -1654,7 +1690,11 @@ def main() -> int:
                     "-i",
                     str(source_path),
                     "-vf",
-                    ffmpeg_subtitles_arg(srt_path),
+                    ffmpeg_subtitle_video_filter(
+                        srt_path,
+                        cover_existing_subtitles=args.cover_existing_subtitles,
+                        subtitle_cover_height=args.subtitle_cover_height,
+                    ),
                     "-c:a",
                     "copy",
                     str(output_path),

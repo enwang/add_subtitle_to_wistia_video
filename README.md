@@ -130,6 +130,18 @@ Use a short clip for speed testing:
 /Users/welsnake/jlaw_video/.venv/bin/python /Users/welsnake/jlaw_video/wistia_srt.py "YOUR_WISTIA_URL" --start 00:01:00 --duration 00:00:20 --model turbo
 ```
 
+Cover subtitles that are already hard-burned into the source video before adding the new subtitles:
+
+```bash
+/Users/welsnake/jlaw_video/.venv/bin/python /Users/welsnake/jlaw_video/wistia_srt.py "YOUR_VIDEO_URL" --cover-existing-subtitles
+```
+
+If the old subtitle block is taller or shorter, adjust the covered bottom area:
+
+```bash
+/Users/welsnake/jlaw_video/.venv/bin/python /Users/welsnake/jlaw_video/wistia_srt.py "YOUR_VIDEO_URL" --cover-existing-subtitles --subtitle-cover-height 0.35
+```
+
 Skip the PDF summary:
 
 ```bash

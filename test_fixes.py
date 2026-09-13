@@ -22,6 +22,7 @@ from wistia_srt import (
     extract_youtube_video_id,
     extract_wistia_media_id,
     fill_gaps,
+    ffmpeg_subtitle_video_filter,
     is_hallucination,
     normalize_input_url,
     resolve_google_drive_virus_warning_url,
@@ -479,6 +480,36 @@ def test_input_url_normalization():
           normalize_input_url("https://example.com/a\\_b") == "https://example.com/a_b")
 
 
+def test_existing_subtitle_cover_filter():
+    print("\n── Subtitle burn filter: cover existing hard subtitles ──────────────────")
+
+    srt = Path("/tmp/example subtitles.srt")
+    default_filter = ffmpeg_subtitle_video_filter(srt)
+    cover_filter = ffmpeg_subtitle_video_filter(
+        srt,
+        cover_existing_subtitles=True,
+        subtitle_cover_height=0.35,
+    )
+    clamped_filter = ffmpeg_subtitle_video_filter(
+        srt,
+        cover_existing_subtitles=True,
+        subtitle_cover_height=0.90,
+    )
+
+    check("Default filter does not cover source video",
+          default_filter.startswith("subtitles=") and "drawbox" not in default_filter,
+          default_filter)
+    check("Cover filter draws black box before burning new subtitles",
+          cover_filter.startswith("drawbox=") and ",subtitles=" in cover_filter,
+          cover_filter)
+    check("Cover height controls bottom area",
+          "y=ih*0.6500" in cover_filter and "h=ih*0.3500" in cover_filter,
+          cover_filter)
+    check("Cover height is clamped to avoid covering most of the video",
+          "h=ih*0.6000" in clamped_filter,
+          clamped_filter)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Google Drive resolver: private files fail early with a useful message
 # ══════════════════════════════════════════════════════════════════════════════
@@ -747,6 +778,7 @@ if __name__ == "__main__":
     test_wistia_resolver_selects_direct_mp4()
     test_youtube_video_id_extraction()
     test_input_url_normalization()
+    test_existing_subtitle_cover_filter()
     test_google_drive_private_file_error()
     test_google_drive_private_file_uses_chrome_cookie_fallback()
     test_google_drive_cookie_fallback_normalizes_markdown_url()
