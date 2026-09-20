@@ -17,8 +17,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 from wistia_srt import (
     SubtitleSegment,
+    classify_chinese_subtitle_text,
     collapse_repetition_loops,
     download_google_drive_file,
+    existing_subtitle_reason_from_probe,
     extract_youtube_video_id,
     extract_wistia_media_id,
     fill_gaps,
@@ -754,6 +756,26 @@ def test_google_drive_virus_warning_link_fallback():
           str(resolved))
 
 
+def test_existing_chinese_subtitle_classification():
+    print("\n── Existing subtitles: simplified vs traditional/Cantonese ─────────────")
+    check(
+        "Simplified Chinese subtitles can be kept",
+        classify_chinese_subtitle_text("这个市场还会继续，我们应该关注这个问题") == "simplified",
+    )
+    check(
+        "Traditional Chinese subtitles are translated",
+        classify_chinese_subtitle_text("這個市場還會繼續，我們應該關注這個問題") == "traditional",
+    )
+    check(
+        "Cantonese subtitles are translated",
+        classify_chinese_subtitle_text("我亦都主張分散幾個板塊，而家睇吓個市場") == "cantonese",
+    )
+    check(
+        "Ambiguous text is translated rather than skipped",
+        classify_chinese_subtitle_text("SPX 7000") == "unknown",
+    )
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Run all tests
 # ══════════════════════════════════════════════════════════════════════════════
@@ -786,6 +808,7 @@ if __name__ == "__main__":
     test_google_drive_oauth_preferred_when_configured()
     test_google_drive_virus_warning_resolves_confirm_url()
     test_google_drive_virus_warning_link_fallback()
+    test_existing_chinese_subtitle_classification()
 
     print("\n" + "=" * 70)
     passed = sum(1 for _, ok in _results if ok)

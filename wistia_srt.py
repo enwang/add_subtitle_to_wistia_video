@@ -684,6 +684,112 @@ def media_duration_seconds(path: Path) -> float | None:
     return duration if duration > 0 else None
 
 
+def existing_subtitle_reason_from_probe(probe: dict) -> str | None:
+    streams = probe.get("streams", [])
+    if any(stream.get("codec_type") == "subtitle" for stream in streams):
+        return "embedded subtitle track"
+
+    tag_values: list[str] = []
+    tag_values.extend(str(value) for value in probe.get("format", {}).get("tags", {}).values())
+    for stream in streams:
+        tag_values.extend(str(value) for value in stream.get("tags", {}).values())
+    if "arctime" in " ".join(tag_values).lower():
+        return "Arctime subtitled-video metadata"
+    return None
+
+
+def existing_subtitle_reason(path: Path) -> str | None:
+    ffprobe = ffprobe_binary()
+    if not ffprobe:
+        return None
+    try:
+        output = subprocess.check_output(
+            [
+                ffprobe,
+                "-v",
+                "error",
+                "-show_entries",
+                "stream=codec_type:stream_tags:format_tags",
+                "-of",
+                "json",
+                str(path),
+            ],
+            text=True,
+        )
+        return existing_subtitle_reason_from_probe(json.loads(output))
+    except (json.JSONDecodeError, subprocess.CalledProcessError, OSError):
+        return None
+
+
+_SIMPLIFIED_MARKERS = set("这说还会为过里后发现应该买卖让进间盘图线经济业资势强续关问题么开从对与时实学总场当只")
+_TRADITIONAL_MARKERS = set("這說還會為過裡後發現應該買賣讓進間盤圖線經濟業資勢強續關問題麼開從對與時實學總場當隻")
+_CANTONESE_MARKERS = (
+    "嘅", "係", "唔", "咁", "嗰", "喺", "冇", "佢", "啲", "咗", "哋", "嚟",
+    "亦都", "而家", "咩", "吓", "噉", "點解", "睇吓",
+)
+
+
+def classify_chinese_subtitle_text(text: str) -> str:
+    compact = re.sub(r"\s+", "", text)
+    simplified = sum(character in _SIMPLIFIED_MARKERS for character in compact)
+    traditional = sum(character in _TRADITIONAL_MARKERS for character in compact)
+    cantonese = sum(compact.count(marker) for marker in _CANTONESE_MARKERS)
+    if cantonese >= 1:
+        return "cantonese"
+    if traditional >= 2 and traditional > simplified:
+        return "traditional"
+    if simplified >= 3 and simplified >= traditional * 2:
+        return "simplified"
+    return "unknown"
+
+
+def hardcoded_subtitle_text(path: Path, ffmpeg: str) -> str:
+    duration = media_duration_seconds(path)
+    ocr_script = Path(__file__).with_name("ocr_subtitles.swift")
+    swift = shutil_which("swift")
+    if not duration or not swift or not ocr_script.exists():
+        return ""
+
+    with tempfile.TemporaryDirectory(prefix="jlaw-subtitle-ocr-") as temp_dir:
+        image_paths: list[Path] = []
+        for index, ratio in enumerate((0.20, 0.35, 0.50, 0.65, 0.80), start=1):
+            image_path = Path(temp_dir) / f"sample-{index}.jpg"
+            try:
+                subprocess.run(
+                    [
+                        ffmpeg,
+                        "-loglevel",
+                        "error",
+                        "-y",
+                        "-ss",
+                        f"{duration * ratio:.3f}",
+                        "-i",
+                        str(path),
+                        "-vf",
+                        "crop=iw:ih*0.40:0:ih*0.60",
+                        "-frames:v",
+                        "1",
+                        str(image_path),
+                    ],
+                    check=True,
+                )
+            except (subprocess.CalledProcessError, OSError):
+                continue
+            if image_path.exists():
+                image_paths.append(image_path)
+        if not image_paths:
+            return ""
+        try:
+            return subprocess.check_output(
+                [swift, str(ocr_script), *(str(path) for path in image_paths)],
+                text=True,
+                stderr=subprocess.DEVNULL,
+                timeout=120,
+            )
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+            return ""
+
+
 def extract_audio_clip(audio_path: Path, start: float, end: float, dest: Path) -> None:
     ffmpeg = ffmpeg_binary()
     if not ffmpeg:
@@ -1486,6 +1592,11 @@ def parse_args() -> argparse.Namespace:
         help="Keep the downloaded source MP4, extracted audio, and generated SRT file.",
     )
     parser.add_argument(
+        "--force-subtitles",
+        action="store_true",
+        help="Transcribe and burn subtitles even when the downloaded video already appears subtitled.",
+    )
+    parser.add_argument(
         "--wistia-height",
         type=int,
         default=None,
@@ -1647,6 +1758,32 @@ def main() -> int:
             source_path.unlink(missing_ok=True)
             clipped_source_path.replace(source_path)
             timings["download"] += time.monotonic() - stage_started
+
+        if not args.force_subtitles:
+            subtitle_reason = existing_subtitle_reason(source_path)
+            if subtitle_reason:
+                subtitle_kind = classify_chinese_subtitle_text(
+                    hardcoded_subtitle_text(source_path, ffmpeg)
+                )
+                if subtitle_kind == "simplified":
+                    print(
+                        f"Existing simplified Chinese subtitles detected ({subtitle_reason}); "
+                        "keeping the downloaded video unchanged.",
+                        flush=True,
+                    )
+                    output_path.unlink(missing_ok=True)
+                    source_path.replace(output_path)
+                    timings["total"] = time.monotonic() - total_started
+                    print("Stage timings:", flush=True)
+                    print(f"  download: {elapsed_label(timings['download'])}", flush=True)
+                    print(f"  total: {elapsed_label(timings['total'])}", flush=True)
+                    print(f"Wrote {output_path}")
+                    return 0
+                print(
+                    f"Existing subtitles found, but OCR classified them as {subtitle_kind}; "
+                    "continuing with translated subtitles.",
+                    flush=True,
+                )
 
         stage_started = time.monotonic()
         run(

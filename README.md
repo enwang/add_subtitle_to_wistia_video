@@ -35,6 +35,8 @@ The PDF summary is written next to it:
 
 For Wistia iframe/media URLs, the script resolves the video to a direct MP4 rendition before downloading. This avoids slow HLS segment-by-segment downloads, which are especially painful on high-latency routes such as China.
 
+After downloading, the script checks for existing subtitle tracks or subtitled-video metadata and samples the subtitle area with macOS Vision OCR. If the existing subtitles are clearly Simplified Chinese, the original video is kept unchanged. Traditional Chinese, Cantonese, and uncertain results continue through the normal translation and subtitle pipeline. Use `--force-subtitles` to bypass this detection and always generate new subtitles.
+
 For YouTube URLs, the script uses `yt-dlp` to download an MP4 source before running the same transcription and subtitle burn-in pipeline. It first tries the best available MP4 rendition through the embedded web client, then falls back to 1080p H.264 and finally to a compatible 360p MP4 if YouTube rejects higher-quality streams. If Node.js is available, it is passed to `yt-dlp` as the JavaScript runtime. Install `yt-dlp` in the active Python environment if needed:
 
 ```bash
