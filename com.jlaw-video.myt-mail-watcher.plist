@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.jlaw-video.myt-mail-watcher</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/welsnake/jlaw_video/.venv/bin/python</string>
+        <string>/Users/welsnake/jlaw_video/gmail_myt_watcher.py</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/welsnake/jlaw_video</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StartInterval</key>
+    <integer>3600</integer>
+    <key>StandardOutPath</key>
+    <string>/Users/welsnake/.cache/jlaw_video/myt_mail_watcher.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/welsnake/.cache/jlaw_video/myt_mail_watcher.error.log</string>
+</dict>
+</plist>

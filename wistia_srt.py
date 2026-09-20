@@ -1452,7 +1452,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "-o",
         "--output",
-        help="Output MP4 path. Defaults to <stream-id>.subtitled.mp4 in the current directory.",
+        help="Output MP4 path. Defaults to ~/Downloads/JLaw Videos/<stream-id>.subtitled.mp4.",
     )
     parser.add_argument(
         "--model",
@@ -1588,8 +1588,9 @@ def main() -> int:
     input_url = args.url
     if not is_google_drive_url(input_url) and not is_youtube_url(input_url):
         input_url = resolve_wistia_mp4_url(input_url, args.wistia_height)
-    default_output_dir = Path.home() / "Downloads"
+    default_output_dir = Path.home() / "Downloads" / "JLaw Videos"
     output_path = Path(args.output) if args.output else default_output_dir / f"{stem}.subtitled.mp4"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     source_path = output_path.with_name(f"{output_path.stem}.source.mp4")
     audio_path = output_path.with_suffix(".m4a")
     srt_path = output_path.with_suffix(".srt")

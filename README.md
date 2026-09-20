@@ -24,13 +24,13 @@ It also accepts Google Drive file URLs and local video files:
 The default output file is written to:
 
 ```bash
-~/Downloads/<video-id>.subtitled.mp4
+~/Downloads/JLaw Videos/<video-id>.subtitled.mp4
 ```
 
 The PDF summary is written next to it:
 
 ```bash
-~/Downloads/<video-id>.subtitled.summary.pdf
+~/Downloads/JLaw Videos/<video-id>.subtitled.summary.pdf
 ```
 
 For Wistia iframe/media URLs, the script resolves the video to a direct MP4 rendition before downloading. This avoids slow HLS segment-by-segment downloads, which are especially painful on high-latency routes such as China.
@@ -76,7 +76,7 @@ Edit the `source`, `srt`, and `output` paths at the top of `burn_subs.py`, then 
 /Users/welsnake/jlaw_video/.venv/bin/python /Users/welsnake/jlaw_video/burn_subs.py
 ```
 
-The output is written to `~/Downloads/<name>.subtitled.mp4`.
+The output is written to `~/Downloads/JLaw Videos/<name>.subtitled.mp4`.
 
 ## Accepted URL formats
 
@@ -152,4 +152,45 @@ Add representative frame pages to the PDF:
 
 ```bash
 /Users/welsnake/jlaw_video/.venv/bin/python /Users/welsnake/jlaw_video/wistia_srt.py "YOUR_WISTIA_URL" --include-summary-images
+```
+
+## Automatically process MYT - JL Gmail videos
+
+`gmail_myt_watcher.py` checks Gmail for new messages whose subject contains
+`[MYT - JL]`. When a new message contains a supported Wistia, YouTube, or
+Google Drive video URL, it runs the normal subtitle pipeline. The first run
+records existing matching messages as a baseline, so old inbox messages are
+not processed accidentally.
+
+Automatic outputs are organized under `~/Downloads/JLaw Videos/` and named
+from the email subject, for example `2026-09-20_大盘.mp4`,
+`2026-09-20_图表.mp4`, or `2026-09-15_Q&A.mp4`.
+
+Authorize Gmail and initialize the baseline:
+
+```bash
+/Users/welsnake/jlaw_video/.venv/bin/python /Users/welsnake/jlaw_video/gmail_myt_watcher.py
+```
+
+The Gmail token is stored at
+`~/.cache/jlaw_video/google_gmail_token.json`, and processed Gmail message IDs
+are stored at `~/.cache/jlaw_video/myt_mail_state.json`. The watcher requests
+read-only Gmail access and does not mark, archive, delete, or send mail.
+
+To run the watcher automatically once per hour on macOS, install the included
+LaunchAgent:
+
+```bash
+mkdir -p ~/Library/LaunchAgents ~/.cache/jlaw_video
+cp com.jlaw-video.myt-mail-watcher.plist ~/Library/LaunchAgents/
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.jlaw-video.myt-mail-watcher.plist
+```
+
+The LaunchAgent also runs once when it is loaded. Its output and error logs are
+written under `~/.cache/jlaw_video/`.
+
+To pass normal subtitle options to each automatic run, put them after `--`:
+
+```bash
+/Users/welsnake/jlaw_video/.venv/bin/python /Users/welsnake/jlaw_video/gmail_myt_watcher.py -- --cover-existing-subtitles --summary-pdf
 ```
