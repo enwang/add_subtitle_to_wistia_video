@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64
 import json
+import subprocess
 import tempfile
 from pathlib import Path
 
@@ -137,10 +138,23 @@ def test_new_myt_video_runs_once() -> None:
         assert calls[0][1] == "https://fast.wistia.net/embed/iframe/abc"
 
 
+def test_notify_user_invokes_macos_notification() -> None:
+    calls = []
+    original = subprocess.run
+    subprocess.run = lambda *args, **kwargs: calls.append((args, kwargs)) or subprocess.CompletedProcess(args, 0)
+    try:
+        assert watcher.notify_user("download failed", "video processing failed") is True
+    finally:
+        subprocess.run = original
+    assert calls[0][0][0][0] == "/usr/bin/osascript"
+    assert "download failed" in calls[0][0][0]
+
+
 if __name__ == "__main__":
     test_supported_video_urls()
     test_html_button_url_is_preserved()
     test_output_name_for_subject()
     test_initial_run_only_creates_baseline()
     test_new_myt_video_runs_once()
-    print("5 passed")
+    test_notify_user_invokes_macos_notification()
+    print("6 passed")

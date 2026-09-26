@@ -29,6 +29,31 @@ SUPPORTED_HOSTS = {
     "www.drive.google.com",
 }
 URL_RE = re.compile(r"https?://[^\s<>\"']+")
+NOTIFICATION_TITLE = "JLaw 视频自动处理"
+
+
+def notify_user(message: str, subtitle: str = "") -> bool:
+    """Show a best-effort macOS notification without hiding the original error."""
+    osascript = Path("/usr/bin/osascript")
+    if not osascript.exists():
+        return False
+    script = (
+        "on run argv\n"
+        "display notification (item 1 of argv) with title (item 2 of argv) "
+        "subtitle (item 3 of argv)\n"
+        "end run"
+    )
+    try:
+        result = subprocess.run(
+            [str(osascript), "-e", script, message[:240], NOTIFICATION_TITLE, subtitle],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        return result.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
 
 
 def oauth_dependencies():
@@ -221,6 +246,7 @@ def process_once(
         urls = supported_video_urls(message_text(payload))
         if not urls:
             print(f"No supported video link in: {subject}", flush=True)
+            notify_user(subject[:180], "邮件中没有找到视频链接")
         for url in urls:
             if url in processed_url_set:
                 continue
@@ -292,4 +318,10 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except Exception as exc:
+        detail = f"{type(exc).__name__}: {exc}"
+        print(f"JLaw mail watcher failed: {detail}", file=sys.stderr, flush=True)
+        notify_user(detail, "下载、翻译或视频处理失败")
+        raise
