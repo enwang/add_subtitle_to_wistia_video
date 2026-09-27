@@ -27,6 +27,7 @@ from wistia_srt import (
     ffmpeg_subtitle_video_filter,
     is_hallucination,
     normalize_input_url,
+    qp_output_name,
     resolve_google_drive_virus_warning_url,
     resolve_google_drive_download_url,
     resolve_wistia_mp4_url,
@@ -470,6 +471,16 @@ def test_youtube_video_id_extraction():
           extract_youtube_video_id("https://fast.wistia.net/embed/iframe/mroy9jmeg2") is None)
 
 
+def test_qp_output_name():
+    print("\n── YouTube organizer: QP channel → dated QP filename ───────────────────")
+    check("Raymond But channel is classified as QP",
+          qp_output_name("Raymond But 畢兄", "20260921") == "2026-09-21_QP.mp4")
+    check("JLaw channel is not classified as QP",
+          qp_output_name("JLaw", "20260921") is None)
+    check("Invalid upload date is not used",
+          qp_output_name("Raymond But 畢兄", "unknown") is None)
+
+
 def test_input_url_normalization():
     print("\n── Input URL normalization: markdown links and escapes ──────────────────")
 
@@ -799,6 +810,7 @@ if __name__ == "__main__":
     test_integration_srt_output()
     test_wistia_resolver_selects_direct_mp4()
     test_youtube_video_id_extraction()
+    test_qp_output_name()
     test_input_url_normalization()
     test_existing_subtitle_cover_filter()
     test_google_drive_private_file_error()

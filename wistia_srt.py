@@ -564,6 +564,43 @@ def yt_dlp_command() -> list[str]:
     )
 
 
+def qp_output_name(channel: str, upload_date: str) -> str | None:
+    normalized_channel = channel.casefold()
+    if not any(marker in normalized_channel for marker in ("raymond but", "畢兄", "毕兄")):
+        return None
+    if not re.fullmatch(r"\d{8}", upload_date):
+        return None
+    return f"{upload_date[:4]}-{upload_date[4:6]}-{upload_date[6:]}_QP.mp4"
+
+
+def youtube_default_output(url: str) -> Path | None:
+    node = shutil_which("node")
+    js_runtime_args = ["--js-runtimes", f"node:{node}"] if node else []
+    cmd = [
+        *yt_dlp_command(),
+        *js_runtime_args,
+        "--remote-components",
+        "ejs:github",
+        "--extractor-args",
+        "youtube:player_client=web_embedded",
+        "--skip-download",
+        "--dump-single-json",
+        url,
+    ]
+    try:
+        result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+        metadata = json.loads(result.stdout)
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
+        return None
+    output_name = qp_output_name(
+        str(metadata.get("channel") or metadata.get("uploader") or ""),
+        str(metadata.get("upload_date") or ""),
+    )
+    if not output_name:
+        return None
+    return Path.home() / "Downloads" / "QP" / output_name
+
+
 def download_youtube_video(url: str, destination: Path) -> None:
     js_runtime_args: list[str] = []
     node = shutil_which("node")
@@ -1558,7 +1595,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "-o",
         "--output",
-        help="Output MP4 path. Defaults to ~/Downloads/JLaw Videos/<stream-id>.subtitled.mp4.",
+        help=(
+            "Output MP4 path. Raymond But/畢兄 YouTube videos default to "
+            "~/Downloads/QP/<date>_QP.mp4; other videos default to "
+            "~/Downloads/JLaw Videos/<stream-id>.subtitled.mp4."
+        ),
     )
     parser.add_argument(
         "--model",
@@ -1700,7 +1741,12 @@ def main() -> int:
     if not is_google_drive_url(input_url) and not is_youtube_url(input_url):
         input_url = resolve_wistia_mp4_url(input_url, args.wistia_height)
     default_output_dir = Path.home() / "Downloads" / "JLaw Videos"
-    output_path = Path(args.output) if args.output else default_output_dir / f"{stem}.subtitled.mp4"
+    detected_output = youtube_default_output(input_url) if is_youtube_url(input_url) else None
+    output_path = (
+        Path(args.output)
+        if args.output
+        else detected_output or default_output_dir / f"{stem}.subtitled.mp4"
+    )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     source_path = output_path.with_name(f"{output_path.stem}.source.mp4")
     audio_path = output_path.with_suffix(".m4a")
