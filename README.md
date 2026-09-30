@@ -49,6 +49,12 @@ For private Google Drive files, the most durable setup is Google Drive OAuth. In
 /Users/welsnake/jlaw_video/.venv/bin/python -m pip install google-api-python-client google-auth-oauthlib google-auth-httplib2
 ```
 
+Install OpenCC once so Chinese transcription is always normalized to Simplified Chinese:
+
+```bash
+/Users/welsnake/jlaw_video/.venv/bin/python -m pip install opencc-python-reimplemented
+```
+
 Create a Google OAuth Desktop client, download its `client_secret_*.json`, and save it here:
 
 ```bash
@@ -131,6 +137,12 @@ Use a short clip for speed testing:
 ```bash
 /Users/welsnake/jlaw_video/.venv/bin/python /Users/welsnake/jlaw_video/wistia_srt.py "YOUR_WISTIA_URL" --start 00:01:00 --duration 00:00:20 --model turbo
 ```
+
+Subtitle verification first detects suspicious segments locally, then asks the authenticated
+Codex CLI to review only those candidates before re-transcribing their audio. This uses Codex
+subscription allowance rather than an Anthropic API key. Use `--no-verify` to skip this step.
+The script prefers the Codex executable bundled with the ChatGPT desktop app and falls back to
+the `codex` command on `PATH`.
 
 Cover subtitles that are already hard-burned into the source video before adding the new subtitles:
 

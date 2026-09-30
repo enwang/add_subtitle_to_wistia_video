@@ -32,6 +32,9 @@ from wistia_srt import (
     resolve_google_drive_download_url,
     resolve_wistia_mp4_url,
     sanitize_segments,
+    simplify_segments,
+    smooth_dense_segments,
+    suspect_segment_indexes,
     timestamp,
     write_srt_from_segments,
 )
@@ -190,6 +193,34 @@ def test_fix1e_phrase_repetition_loop_is_hallucination():
           is_hallucination("可能会是什么,可能会是什么,可能会是什么,可能会是什么"))
     check("Natural repeated finance wording is preserved",
           not is_hallucination("这个位置可能会有反弹, 但需要等确认, 可能会有机会"))
+
+
+def test_fix1f_silence_hallucination_and_simplified_output():
+    print("\n── Fix 1f: Silence hallucinations and Simplified Chinese ───────────────")
+    check("谢谢大家 is treated as a hallucination", is_hallucination("谢谢大家"))
+    converted = simplify_segments([
+        SubtitleSegment(start=0.0, end=2.0, text="這週市場會繼續觀察"),
+    ])
+    check("Traditional Chinese is converted to Simplified Chinese",
+          converted[0].text == "这周市场会继续观察", converted[0].text)
+
+
+def test_fix1g_local_candidate_filter_and_timing_smoothing():
+    print("\n── Fix 1g: Local Codex candidate filter and timing smoothing ───────────")
+    segments = [
+        SubtitleSegment(start=0.0, end=2.0, text="市场今天正常波动"),
+        SubtitleSegment(start=2.0, end=4.0, text="可能会是什么,可能会是什么,可能会是什么"),
+        SubtitleSegment(start=4.0, end=6.0, text="继续观察支持位"),
+    ]
+    check("Repetition loop is selected for Codex review",
+          suspect_segment_indexes(segments) == [1], str(suspect_segment_indexes(segments)))
+
+    dense = smooth_dense_segments([
+        SubtitleSegment(start=0.0, end=0.4, text="第一句"),
+        SubtitleSegment(start=0.4, end=0.8, text="第二句"),
+        SubtitleSegment(start=0.8, end=2.0, text="第三句内容"),
+    ])
+    check("Fast adjacent captions are merged", len(dense) < 3, str(dense))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -802,6 +833,8 @@ if __name__ == "__main__":
     test_fix1c_containment()
     test_fix1d_phrase_repetition_loop_collapsed()
     test_fix1e_phrase_repetition_loop_is_hallucination()
+    test_fix1f_silence_hallucination_and_simplified_output()
+    test_fix1g_local_candidate_filter_and_timing_smoothing()
     test_fix2_condition_on_previous_text_param()
     test_fix3_gap_detected_and_filled()
     test_fix3_leading_gap_filled()

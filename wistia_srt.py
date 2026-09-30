@@ -5,6 +5,7 @@ import argparse
 import html
 import importlib.util
 import json
+import math
 import os
 import re
 import shutil
@@ -29,6 +30,12 @@ try:
     _ANTHROPIC_AVAILABLE = True
 except ImportError:
     _ANTHROPIC_AVAILABLE = False
+
+try:
+    from opencc import OpenCC as _OpenCC
+    _SIMPLIFIED_CONVERTER = _OpenCC("t2s")
+except ImportError:
+    _SIMPLIFIED_CONVERTER = None
 
 # Primer sentence in simplified Chinese — biases Whisper toward simplified characters
 _SIMPLIFIED_CHINESE_PROMPT = "以下是普通话或粤语财经视频的字幕内容。"
@@ -880,29 +887,38 @@ def fill_gaps(
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
             for i, (gap_start, gap_end) in enumerate(gaps):
-                clip_path = Path(tmpdir) / f"gap_{i}.m4a"
-                print(
-                    f"  Gap {i + 1}/{len(gaps)}: {timestamp(gap_start)} → {timestamp(gap_end)} "
-                    f"({gap_end - gap_start:.1f}s)",
-                    flush=True,
-                )
-                try:
-                    extract_audio_clip(audio_path, gap_start, gap_end, clip_path)
-                    clip_segments = transcribe_clip(clip_path)
-                    if clip_segments:
-                        print(f"    Recovered {len(clip_segments)} segment(s)", flush=True)
-                        for seg in clip_segments:
-                            recovered.append(
-                                SubtitleSegment(
-                                    start=seg.start + gap_start,
-                                    end=seg.end + gap_start,
-                                    text=seg.text,
+                chunk_start = gap_start
+                chunk_number = 0
+                while chunk_start < gap_end:
+                    chunk_end = min(chunk_start + 30.0, gap_end)
+                    clip_path = Path(tmpdir) / f"gap_{i}_{chunk_number}.m4a"
+                    print(
+                        f"  Gap {i + 1}/{len(gaps)}: {timestamp(chunk_start)} → {timestamp(chunk_end)} "
+                        f"({chunk_end - chunk_start:.1f}s)",
+                        flush=True,
+                    )
+                    try:
+                        extract_audio_clip(audio_path, chunk_start, chunk_end, clip_path)
+                        clip_segments = [
+                            seg for seg in transcribe_clip(clip_path)
+                            if seg.text.strip() and not is_hallucination(seg.text)
+                        ]
+                        if clip_segments:
+                            print(f"    Recovered {len(clip_segments)} segment(s)", flush=True)
+                            for seg in clip_segments:
+                                recovered.append(
+                                    SubtitleSegment(
+                                        start=max(chunk_start, seg.start + chunk_start),
+                                        end=min(chunk_end, seg.end + chunk_start),
+                                        text=seg.text,
+                                    )
                                 )
-                            )
-                    else:
-                        print(f"    No speech found (genuine silence)", flush=True)
-                except Exception as exc:
-                    print(f"    Warning: gap re-transcription failed: {exc}", flush=True)
+                        else:
+                            print("    No reliable speech found", flush=True)
+                    except Exception as exc:
+                        print(f"    Warning: gap re-transcription failed: {exc}", flush=True)
+                    chunk_start = chunk_end
+                    chunk_number += 1
     except Exception as exc:
         print(f"Gap fill: setup failed ({exc}), continuing without gap recovery.", flush=True)
         return segments
@@ -915,15 +931,85 @@ def fill_gaps(
     return merged
 
 
-def _call_coherence_tool(lines: list[str], api_key: str, language: str | None) -> dict:
-    """Call Claude to flag incoherent subtitle segments. Returns tool input dict or {} on failure."""
-    if not _ANTHROPIC_AVAILABLE:
-        return {}
+def codex_binary() -> str | None:
+    """Find a working Codex executable, preferring the desktop app bundle."""
+    candidates = [
+        Path("/Applications/ChatGPT.app/Contents/Resources/codex"),
+        Path.home() / "Applications/ChatGPT.app/Contents/Resources/codex",
+    ]
+    path_codex = shutil_which("codex")
+    if path_codex:
+        candidates.append(Path(path_codex))
+    for candidate in candidates:
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    return None
+
+
+def suspect_segment_indexes(segments: list[SubtitleSegment], max_ratio: float = 0.15) -> list[int]:
+    """Select obvious anomalies locally before spending Codex quota."""
+    if not segments:
+        return []
+
+    scored: list[tuple[int, int]] = []
+    recent_text: dict[str, int] = {}
+    for index, seg in enumerate(segments):
+        text = re.sub(r"\s+", "", seg.text)
+        duration = max(seg.end - seg.start, 0.1)
+        score = 0
+        collapsed, repeated = collapse_repetition_loops(text)
+        if repeated or is_hallucination(text):
+            score += 100
+        if len(text) >= 80:
+            score += 6
+        elif len(text) >= 55:
+            score += 3
+        if len(text) >= 20 and len(text) / duration >= 12:
+            score += 5
+        if re.search(r"(.{2,12})\1{2,}", text):
+            score += 8
+        if re.search(r"([，。！？,.!?])\1{2,}", text):
+            score += 4
+        previous = recent_text.get(text)
+        if text and previous is not None and index - previous <= 8:
+            score += 6
+        if text:
+            recent_text[text] = index
+        if collapsed != text:
+            score += 2
+        if score:
+            scored.append((score, index))
+
+    limit = max(1, math.ceil(len(segments) * max_ratio))
+    selected = sorted(scored, key=lambda item: (-item[0], item[1]))[:limit]
+    return sorted(index for _, index in selected)
+
+
+def _call_codex_coherence(
+    segments: list[SubtitleSegment],
+    candidate_indexes: list[int],
+    language: str | None,
+) -> dict:
+    """Ask local Codex to review only preselected subtitle anomalies."""
+    executable = codex_binary()
+    if not executable:
+        raise RuntimeError("Codex executable not found; install Codex or the ChatGPT desktop app")
+
     lang_hint = f" The video is in language code '{language}'." if language else ""
     hallucination_examples = "感谢收看, 感谢观看, 感谢您的观看, 请订阅, 请记得订阅, 别忘了点赞, 字幕提供, 敬请期待, 如果你觉得有用请点赞, 谢谢收看, 多谢收看"
+    context_indexes: set[int] = set()
+    for index in candidate_indexes:
+        context_indexes.update(range(max(0, index - 2), min(len(segments), index + 3)))
+    candidate_set = set(candidate_indexes)
+    lines = [
+        f"{index}: {'CANDIDATE' if index in candidate_set else 'CONTEXT'} "
+        f"[{timestamp(segments[index].start)}] {segments[index].text}"
+        for index in sorted(context_indexes)
+    ]
     prompt = (
         f"You are reviewing auto-generated subtitles for a Cantonese/Mandarin financial video.{lang_hint}\n"
-        "Each line is formatted as INDEX: [HH:MM:SS] subtitle_text.\n\n"
+        "Each line has a GLOBAL INDEX and is marked CANDIDATE or CONTEXT. "
+        "Only return CANDIDATE indexes; context lines are provided only to help judgment.\n\n"
         "Flag any segment that is LIKELY WRONG due to:\n"
         "1. English finance terms mis-transcribed as phonetically similar Chinese characters "
         "(e.g. 'draw down' → '阻挡', 'cut loss' → '卡罗斯', 'support level' → '撑位' when clearly English was spoken)\n"
@@ -936,76 +1022,77 @@ def _call_coherence_tool(lines: list[str], api_key: str, language: str | None) -
         "Be CONSERVATIVE: only flag segments you are CONFIDENT are wrong. "
         "Do NOT flag segments that are merely unusual. "
         "Mixed Chinese/English is completely normal in Cantonese financial speech.\n\n"
-        "Segments to review:\n"
-        + "\n".join(f"{i}: {line}" for i, line in enumerate(lines))
+        "Segments to review:\n" + "\n".join(lines)
     )
-    tool = {
-        "name": "flag_incoherent_segments",
-        "description": "Flag subtitle segments that appear incorrect or hallucinatory given surrounding context.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "flagged": {
-                    "type": "array",
-                    "description": "Segments to re-transcribe. Empty array if none.",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "index": {"type": "integer", "description": "0-based index within the provided list"},
-                            "reason": {"type": "string", "description": "Brief reason this segment appears wrong"},
-                        },
-                        "required": ["index", "reason"],
+    schema = {
+        "type": "object",
+        "properties": {
+            "flagged": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "index": {"type": "integer"},
+                        "reason": {"type": "string"},
                     },
-                }
-            },
-            "required": ["flagged"],
+                    "required": ["index", "reason"],
+                    "additionalProperties": False,
+                },
+            }
         },
+        "required": ["flagged"],
+        "additionalProperties": False,
     }
-    client = _anthropic.Anthropic(api_key=api_key)
-    response = client.messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=1024,
-        tools=[tool],
-        tool_choice={"type": "tool", "name": "flag_incoherent_segments"},
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.0,
-    )
-    for block in response.content:
-        if block.type == "tool_use" and block.name == "flag_incoherent_segments":
-            return block.input
-    return {}
+
+    with tempfile.TemporaryDirectory(prefix="jlaw-codex-review-") as tmpdir:
+        schema_path = Path(tmpdir) / "schema.json"
+        output_path = Path(tmpdir) / "result.json"
+        schema_path.write_text(json.dumps(schema, ensure_ascii=False), encoding="utf-8")
+        completed = subprocess.run(
+            [
+                executable, "exec", "--ephemeral", "--sandbox", "read-only",
+                "--skip-git-repo-check", "--output-schema", str(schema_path),
+                "--output-last-message", str(output_path), "--cd", tmpdir, "-",
+            ],
+            input=prompt,
+            text=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            timeout=300,
+            check=False,
+        )
+        if completed.returncode != 0:
+            detail = completed.stderr.strip().splitlines()[-1] if completed.stderr.strip() else "unknown error"
+            raise RuntimeError(f"Codex exited with status {completed.returncode}: {detail}")
+        return json.loads(output_path.read_text(encoding="utf-8"))
 
 
 def check_coherence(
     segments: list[SubtitleSegment],
-    api_key: str,
     language: str | None,
 ) -> list[tuple[int, str]]:
-    """Slide a window over segments and ask Claude to flag incoherent ones.
-    Returns list of (global_index, reason) sorted ascending. Returns [] on any failure.
-    """
+    """Use local anomaly detection, then ask Codex to judge the candidates."""
     if not segments:
         return []
     try:
-        WINDOW_SIZE = 20
-        STEP = 15
-        flagged_map: dict[int, str] = {}
-
-        for window_start in range(0, len(segments), STEP):
-            window = segments[window_start: window_start + WINDOW_SIZE]
-            lines = [f"[{timestamp(seg.start)}] {seg.text}" for seg in window]
-            result = _call_coherence_tool(lines, api_key, language)
-            for item in result.get("flagged") or []:
-                local_idx = item.get("index")
-                reason = item.get("reason", "")
-                if isinstance(local_idx, int) and 0 <= local_idx < len(window):
-                    global_idx = window_start + local_idx
-                    if global_idx not in flagged_map:
-                        flagged_map[global_idx] = reason
-
-        return sorted(flagged_map.items())
+        candidates = suspect_segment_indexes(segments)
+        if not candidates:
+            print("Codex verification: local scan found no suspicious segments.", flush=True)
+            return []
+        print(
+            f"Codex verification: reviewing {len(candidates)}/{len(segments)} locally flagged segment(s)...",
+            flush=True,
+        )
+        result = _call_codex_coherence(segments, candidates, language)
+        candidate_set = set(candidates)
+        flagged: list[tuple[int, str]] = []
+        for item in result.get("flagged") or []:
+            index = item.get("index")
+            if isinstance(index, int) and index in candidate_set:
+                flagged.append((index, str(item.get("reason", ""))))
+        return sorted(dict(flagged).items())
     except Exception as exc:
-        print(f"\nLLM coherence check failed ({exc}), skipping verification.", flush=True)
+        print(f"\nCodex coherence check failed ({exc}), skipping verification.", flush=True)
         return []
 
 
@@ -1013,21 +1100,20 @@ def verify_and_retry(
     segments: list[SubtitleSegment],
     audio_path: Path,
     transcribe_clip: Callable[[Path], list[SubtitleSegment]],
-    api_key: str,
     language: str | None,
 ) -> list[SubtitleSegment]:
-    """Ask Claude to flag incoherent segments, then re-transcribe those audio windows."""
+    """Ask Codex to flag preselected anomalies, then re-transcribe their audio."""
     if not segments:
         return segments
 
-    print(f"\nLLM verification: checking {len(segments)} segment(s) for coherence...", flush=True)
-    flagged = check_coherence(segments, api_key, language)
+    print(f"\nCodex verification: locally scanning {len(segments)} segment(s)...", flush=True)
+    flagged = check_coherence(segments, language)
 
     if not flagged:
-        print("LLM verification: no issues found.", flush=True)
+        print("Codex verification: no issues found.", flush=True)
         return segments
 
-    print(f"LLM verification: {len(flagged)} segment(s) flagged for re-transcription.", flush=True)
+    print(f"Codex verification: {len(flagged)} segment(s) flagged for re-transcription.", flush=True)
     result: list[SubtitleSegment] = list(segments)
     offset = 0
 
@@ -1082,10 +1168,10 @@ def verify_and_retry(
                 offset += len(adjusted) - 1
 
     except Exception as exc:
-        print(f"LLM verification: setup failed ({exc}), returning segments as-is.", flush=True)
+        print(f"Codex verification: setup failed ({exc}), returning segments as-is.", flush=True)
         return segments
 
-    print(f"LLM verification: complete. {len(segments)} → {len(result)} segment(s).", flush=True)
+    print(f"Codex verification: complete. {len(segments)} → {len(result)} segment(s).", flush=True)
     return result
 
 
@@ -1097,6 +1183,9 @@ _HALLUCINATION_SUBSTRINGS: tuple[str, ...] = (
     "感谢您的观看",
     "谢谢收看",
     "多谢收看",
+    "谢谢大家",
+    "多谢大家",
+    "感谢大家",
     "请订阅",
     "记得订阅",
     "别忘了点赞",
@@ -1345,6 +1434,47 @@ def sanitize_segments(segments: list[SubtitleSegment]) -> list[SubtitleSegment]:
     return cleaned
 
 
+def smooth_dense_segments(segments: list[SubtitleSegment], max_chars: int = 42) -> list[SubtitleSegment]:
+    """Merge adjacent flashes that would otherwise be too fast to read."""
+    if not segments:
+        return segments
+    smoothed: list[SubtitleSegment] = []
+    merged_count = 0
+    for seg in sorted(segments, key=lambda item: (item.start, item.end)):
+        if not smoothed:
+            smoothed.append(seg)
+            continue
+        previous = smoothed[-1]
+        previous_duration = max(previous.end - previous.start, 0.1)
+        current_duration = max(seg.end - seg.start, 0.1)
+        previous_fast = previous_duration < 0.8 or len(previous.text) / previous_duration > 14
+        current_fast = current_duration < 0.8 or len(seg.text) / current_duration > 14
+        close = seg.start - previous.end <= 0.25
+        combined_text = f"{previous.text} {seg.text}".strip()
+        if close and (previous_fast or current_fast) and len(combined_text) <= max_chars:
+            smoothed[-1] = SubtitleSegment(previous.start, max(previous.end, seg.end), combined_text)
+            merged_count += 1
+        else:
+            smoothed.append(seg)
+    if merged_count:
+        print(f"Subtitle timing: merged {merged_count} overly fast segment(s).", flush=True)
+    return smoothed
+
+
+def simplify_segments(segments: list[SubtitleSegment]) -> list[SubtitleSegment]:
+    """Convert Chinese subtitle text to Simplified Chinese deterministically."""
+    if _SIMPLIFIED_CONVERTER is None:
+        print(
+            "Warning: OpenCC is unavailable; install opencc-python-reimplemented for guaranteed Simplified Chinese.",
+            flush=True,
+        )
+        return segments
+    return [
+        SubtitleSegment(seg.start, seg.end, _SIMPLIFIED_CONVERTER.convert(seg.text))
+        for seg in segments
+    ]
+
+
 def strip_known_hallucinations(segments: list[SubtitleSegment]) -> list[SubtitleSegment]:
     """Remove segments whose text contains a known Whisper hallucination phrase."""
     kept = []
@@ -1364,6 +1494,7 @@ def write_srt_from_segments(segments: list[SubtitleSegment], srt_path: Path) -> 
     """Write sanitized segments to an SRT file. Returns the number of segments written."""
     clean = sanitize_segments(segments)
     clean = strip_known_hallucinations(clean)
+    clean = smooth_dense_segments(clean)
     with srt_path.open("w", encoding="utf-8") as handle:
         for i, seg in enumerate(clean, 1):
             handle.write(f"{i}\n{timestamp(seg.start)} --> {timestamp(seg.end)}\n{seg.text}\n\n")
@@ -1462,13 +1593,12 @@ def _write_srt_mlx(
     if gap_fill and duration and subtitle_segments:
         subtitle_segments = fill_gaps(subtitle_segments, audio_path, duration, gap_threshold, _mlx_transcribe_clip)
 
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if verify and api_key:
-        subtitle_segments = verify_and_retry(subtitle_segments, audio_path, _mlx_transcribe_clip, api_key, language)
-    elif verify and not api_key:
-        print("Skipping LLM verification: ANTHROPIC_API_KEY not set.", flush=True)
+    if verify:
+        subtitle_segments = verify_and_retry(subtitle_segments, audio_path, _mlx_transcribe_clip, language)
 
     subtitle_segments = retranscribe_hallucinations(subtitle_segments, audio_path, _mlx_transcribe_clip)
+    if not traditional and task == "transcribe":
+        subtitle_segments = simplify_segments(subtitle_segments)
 
     written = write_srt_from_segments(subtitle_segments, srt_path)
     return written, {"model_load": load_elapsed, "transcribe": transcribe_elapsed}, subtitle_segments, detected_language
@@ -1572,13 +1702,12 @@ def _write_srt_faster_whisper(
     if gap_fill and duration and subtitle_segments:
         subtitle_segments = fill_gaps(subtitle_segments, audio_path, duration, gap_threshold, _fw_transcribe_clip)
 
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if verify and api_key:
-        subtitle_segments = verify_and_retry(subtitle_segments, audio_path, _fw_transcribe_clip, api_key, language)
-    elif verify and not api_key:
-        print("Skipping LLM verification: ANTHROPIC_API_KEY not set.", flush=True)
+    if verify:
+        subtitle_segments = verify_and_retry(subtitle_segments, audio_path, _fw_transcribe_clip, language)
 
     subtitle_segments = retranscribe_hallucinations(subtitle_segments, audio_path, _fw_transcribe_clip)
+    if not traditional and task == "transcribe":
+        subtitle_segments = simplify_segments(subtitle_segments)
 
     written = write_srt_from_segments(subtitle_segments, srt_path)
     return written, {
@@ -1699,7 +1828,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--no-verify",
         action="store_true",
-        help="Disable LLM semantic verification and retry of suspect segments. Default: on if ANTHROPIC_API_KEY is set.",
+        help="Disable local anomaly detection, Codex review, and retry of suspect segments. Default: on.",
     )
     parser.add_argument(
         "--traditional",
