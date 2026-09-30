@@ -144,6 +144,10 @@ subscription allowance rather than an Anthropic API key. Use `--no-verify` to sk
 The script prefers the Codex executable bundled with the ChatGPT desktop app and falls back to
 the `codex` command on `PATH`.
 
+Generated SRT files are archived under `~/.cache/jlaw_video/subtitles/` for later quality review,
+even when normal source/audio intermediates are removed. Existing subtitle detection uses the
+local macOS Vision framework, with local Tesseract OCR as a fallback.
+
 Cover subtitles that are already hard-burned into the source video before adding the new subtitles:
 
 ```bash
@@ -202,6 +206,7 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.jlaw-video.myt-mail-
 
 The LaunchAgent also runs once when it is loaded. Its output and error logs are
 written under `~/.cache/jlaw_video/`.
+Overlapping hourly runs are automatically skipped while a previous video is still processing.
 
 To pass normal subtitle options to each automatic run, put them after `--`:
 

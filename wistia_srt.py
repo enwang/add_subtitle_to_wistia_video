@@ -43,6 +43,7 @@ _DRIVE_CACHE_PATH = Path.home() / ".cache" / "jlaw_video" / "drive_cache.json"
 _DRIVE_OAUTH_TOKEN_PATH = Path.home() / ".cache" / "jlaw_video" / "google_drive_token.json"
 _DRIVE_OAUTH_CLIENT_PATH = Path.home() / ".config" / "jlaw_video" / "google_drive_client_secret.json"
 _DRIVE_OAUTH_SCOPE = ["https://www.googleapis.com/auth/drive.readonly"]
+_SUBTITLE_ARCHIVE_DIR = Path.home() / ".cache" / "jlaw_video" / "subtitles"
 
 # Load .env from the same directory as this script
 _env_path = Path(__file__).parent / ".env"
@@ -774,6 +775,8 @@ _CANTONESE_MARKERS = (
 
 
 def classify_chinese_subtitle_text(text: str) -> str:
+    if text.startswith("__SUBTITLE_CLASSIFICATION__:"):
+        return text.partition(":")[2]
     compact = re.sub(r"\s+", "", text)
     simplified = sum(character in _SIMPLIFIED_MARKERS for character in compact)
     traditional = sum(character in _TRADITIONAL_MARKERS for character in compact)
@@ -787,16 +790,43 @@ def classify_chinese_subtitle_text(text: str) -> str:
     return "unknown"
 
 
+def vision_ocr_binary() -> str | None:
+    """Build and cache the local Objective-C Vision OCR helper."""
+    source = Path(__file__).with_name("ocr_subtitles.m")
+    clang = shutil_which("clang")
+    if not source.exists() or not clang:
+        return None
+    binary = Path.home() / ".cache" / "jlaw_video" / "ocr_subtitles"
+    if binary.exists() and os.access(binary, os.X_OK) and binary.stat().st_mtime >= source.stat().st_mtime:
+        return str(binary)
+    try:
+        binary.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run(
+            [
+                clang, "-fobjc-arc", "-framework", "Foundation", "-framework", "AppKit",
+                "-framework", "Vision", str(source), "-o", str(binary),
+            ],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        return str(binary)
+    except (subprocess.CalledProcessError, OSError) as exc:
+        print(f"Could not build local Vision OCR helper ({exc}).", flush=True)
+        return None
+
+
 def hardcoded_subtitle_text(path: Path, ffmpeg: str) -> str:
     duration = media_duration_seconds(path)
     ocr_script = Path(__file__).with_name("ocr_subtitles.swift")
     swift = shutil_which("swift")
-    if not duration or not swift or not ocr_script.exists():
+    if not duration:
         return ""
 
     with tempfile.TemporaryDirectory(prefix="jlaw-subtitle-ocr-") as temp_dir:
         image_paths: list[Path] = []
-        for index, ratio in enumerate((0.20, 0.35, 0.50, 0.65, 0.80), start=1):
+        for index, ratio in enumerate((0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90), start=1):
             image_path = Path(temp_dir) / f"sample-{index}.jpg"
             try:
                 subprocess.run(
@@ -810,7 +840,7 @@ def hardcoded_subtitle_text(path: Path, ffmpeg: str) -> str:
                         "-i",
                         str(path),
                         "-vf",
-                        "crop=iw:ih*0.40:0:ih*0.60",
+                        "crop=iw:ih*0.32:0:ih*0.68",
                         "-frames:v",
                         "1",
                         str(image_path),
@@ -823,15 +853,50 @@ def hardcoded_subtitle_text(path: Path, ffmpeg: str) -> str:
                 image_paths.append(image_path)
         if not image_paths:
             return ""
-        try:
-            return subprocess.check_output(
-                [swift, str(ocr_script), *(str(path) for path in image_paths)],
-                text=True,
-                stderr=subprocess.DEVNULL,
-                timeout=120,
-            )
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+        local_vision = vision_ocr_binary()
+        if local_vision:
+            try:
+                return subprocess.check_output(
+                    [local_vision, *(str(path) for path in image_paths)],
+                    text=True,
+                    stderr=subprocess.PIPE,
+                    timeout=120,
+                )
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
+                print(f"Local Vision subtitle OCR unavailable ({exc}); trying fallbacks.", flush=True)
+        if swift and ocr_script.exists():
+            try:
+                return subprocess.check_output(
+                    [swift, str(ocr_script), *(str(path) for path in image_paths)],
+                    text=True,
+                    stderr=subprocess.PIPE,
+                    timeout=120,
+                )
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
+                print(f"Vision subtitle OCR unavailable ({exc}); trying Tesseract.", flush=True)
+        else:
+            print("Vision subtitle OCR unavailable; trying Tesseract.", flush=True)
+
+        tesseract = shutil_which("tesseract")
+        if not tesseract:
+            print("Subtitle OCR unavailable: neither Vision nor Tesseract succeeded.", flush=True)
             return ""
+        recognized: list[str] = []
+        for image_path in image_paths:
+            try:
+                text = subprocess.check_output(
+                    [tesseract, str(image_path), "stdout", "-l", "chi_sim+chi_tra+eng", "--psm", "6"],
+                    text=True,
+                    stderr=subprocess.DEVNULL,
+                    timeout=60,
+                ).strip()
+                if text:
+                    recognized.append(text)
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+                continue
+        if not recognized:
+            print("Tesseract subtitle OCR returned no text.", flush=True)
+        return "\n".join(recognized)
 
 
 def extract_audio_clip(audio_path: Path, start: float, end: float, dest: Path) -> None:
@@ -1208,8 +1273,9 @@ _HALLUCINATION_SUBSTRINGS: tuple[str, ...] = (
 def is_hallucination(text: str) -> bool:
     if any(phrase in text for phrase in _HALLUCINATION_SUBSTRINGS):
         return True
-    # Whisper repetition loop: any CJK character (or any char) repeated 3+ times consecutively
-    if re.search(r'(.)\1{2,}', text):
+    # Repeated Chinese glyphs can signal a Whisper loop. Latin ticker symbols and
+    # repeated digits (TQQQ, 2000) are normal financial content and must survive.
+    if re.search(r'([\u3400-\u9fff])\1{2,}', text):
         return True
     collapsed, changed = collapse_repetition_loops(text)
     if changed and len(collapsed) <= max(12, len(text) * 0.75):
@@ -1994,6 +2060,11 @@ def main() -> int:
             traditional=args.traditional,
         )
         timings.update(transcription_timings)
+        if srt_path.exists():
+            _SUBTITLE_ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
+            archived_srt = _SUBTITLE_ARCHIVE_DIR / f"{output_path.stem}.srt"
+            shutil.copy2(srt_path, archived_srt)
+            print(f"Archived subtitle QA file: {archived_srt}", flush=True)
         if subtitle_count:
             stage_started = time.monotonic()
             run(

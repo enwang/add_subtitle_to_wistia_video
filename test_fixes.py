@@ -198,6 +198,9 @@ def test_fix1e_phrase_repetition_loop_is_hallucination():
 def test_fix1f_silence_hallucination_and_simplified_output():
     print("\n── Fix 1f: Silence hallucinations and Simplified Chinese ───────────────")
     check("谢谢大家 is treated as a hallucination", is_hallucination("谢谢大家"))
+    for finance_text in ("TQQQ, SOXL", "罗素2000指数", "ETF就是SOXL和TQQQ"):
+        check(f"Financial text is not treated as hallucination: {finance_text}",
+              not is_hallucination(finance_text))
     converted = simplify_segments([
         SubtitleSegment(start=0.0, end=2.0, text="這週市場會繼續觀察"),
     ])

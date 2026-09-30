@@ -5,6 +5,7 @@ import base64
 import json
 import subprocess
 import tempfile
+import fcntl
 from pathlib import Path
 
 import gmail_myt_watcher as watcher
@@ -150,6 +151,18 @@ def test_notify_user_invokes_macos_notification() -> None:
     assert "download failed" in calls[0][0][0]
 
 
+def test_process_lock_rejects_overlapping_run() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        lock_path = Path(temp_dir) / "watcher.lock"
+        with lock_path.open("a+") as held:
+            fcntl.flock(held.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with watcher.process_lock(lock_path) as acquired:
+                assert acquired is False
+            fcntl.flock(held.fileno(), fcntl.LOCK_UN)
+        with watcher.process_lock(lock_path) as acquired:
+            assert acquired is True
+
+
 if __name__ == "__main__":
     test_supported_video_urls()
     test_html_button_url_is_preserved()
@@ -157,4 +170,5 @@ if __name__ == "__main__":
     test_initial_run_only_creates_baseline()
     test_new_myt_video_runs_once()
     test_notify_user_invokes_macos_notification()
-    print("6 passed")
+    test_process_lock_rejects_overlapping_run()
+    print("7 passed")

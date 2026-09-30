@@ -3,12 +3,14 @@ from __future__ import annotations
 
 import argparse
 import base64
+import fcntl
 import html
 import json
 import os
 import re
 import subprocess
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -16,6 +18,7 @@ from urllib.parse import urlparse
 DEFAULT_CLIENT_PATH = Path.home() / ".config" / "jlaw_video" / "google_drive_client_secret.json"
 DEFAULT_TOKEN_PATH = Path.home() / ".cache" / "jlaw_video" / "google_gmail_token.json"
 DEFAULT_STATE_PATH = Path.home() / ".cache" / "jlaw_video" / "myt_mail_state.json"
+DEFAULT_LOCK_PATH = Path.home() / ".cache" / "jlaw_video" / "myt_mail_watcher.lock"
 DEFAULT_OUTPUT_DIR = Path.home() / "Downloads" / "JLaw Videos"
 GMAIL_SCOPE = ["https://www.googleapis.com/auth/gmail.readonly"]
 SUBJECT_MARKER = "[MYT - JL]"
@@ -30,6 +33,22 @@ SUPPORTED_HOSTS = {
 }
 URL_RE = re.compile(r"https?://[^\s<>\"']+")
 NOTIFICATION_TITLE = "JLaw 视频自动处理"
+
+
+@contextmanager
+def process_lock(path: Path):
+    """Prevent hourly LaunchAgent runs from processing the same video concurrently."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+") as handle:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def notify_user(message: str, subtitle: str = "") -> bool:
@@ -275,6 +294,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--client", type=Path, default=DEFAULT_CLIENT_PATH)
     parser.add_argument("--token", type=Path, default=DEFAULT_TOKEN_PATH)
     parser.add_argument("--state", type=Path, default=DEFAULT_STATE_PATH)
+    parser.add_argument("--lock", type=Path, default=DEFAULT_LOCK_PATH)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument(
         "--query",
@@ -304,16 +324,20 @@ def main() -> int:
     extra_args = args.script_args
     if extra_args[:1] == ["--"]:
         extra_args = extra_args[1:]
-    service = gmail_service(args.client.expanduser(), args.token.expanduser())
-    process_once(
-        service,
-        args.state.expanduser(),
-        args.script.expanduser(),
-        args.query,
-        extra_args,
-        process_existing=args.process_existing,
-        output_dir=args.output_dir.expanduser(),
-    )
+    with process_lock(args.lock.expanduser()) as acquired:
+        if not acquired:
+            print("Another JLaw mail watcher is still processing; skipping this hourly run.", flush=True)
+            return 0
+        service = gmail_service(args.client.expanduser(), args.token.expanduser())
+        process_once(
+            service,
+            args.state.expanduser(),
+            args.script.expanduser(),
+            args.query,
+            extra_args,
+            process_existing=args.process_existing,
+            output_dir=args.output_dir.expanduser(),
+        )
     return 0
 
 
