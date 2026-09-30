@@ -668,7 +668,7 @@ def ffmpeg_subtitles_arg(path: Path) -> str:
     raw = str(path.resolve())
     raw = raw.replace("\\", "\\\\").replace(":", r"\:").replace("'", r"\'")
     style = (
-        "FontName=PingFang SC,"
+        "FontName=Heiti SC,"
         "FontSize=20,"
         "PrimaryColour=&H00FFFFFF,"
         "OutlineColour=&H00000000,"
@@ -1527,6 +1527,57 @@ def smooth_dense_segments(segments: list[SubtitleSegment], max_chars: int = 42) 
     return smoothed
 
 
+def split_long_segments(segments: list[SubtitleSegment], max_chars: int = 42) -> list[SubtitleSegment]:
+    """Split oversized cues so libass does not render three or more lines."""
+    result: list[SubtitleSegment] = []
+    split_count = 0
+    for seg in segments:
+        text = re.sub(r"\s+", " ", seg.text).strip()
+        if len(text) <= max_chars:
+            result.append(SubtitleSegment(seg.start, seg.end, text))
+            continue
+
+        clauses = re.findall(r"[^，。！？；,.!?;]+[，。！？；,.!?;]?", text)
+        chunks: list[str] = []
+        current = ""
+        for clause in clauses or [text]:
+            clause = clause.strip()
+            if not clause:
+                continue
+            if len(clause) > max_chars:
+                if current:
+                    chunks.append(current)
+                    current = ""
+                chunks.extend(
+                    clause[start:start + max_chars]
+                    for start in range(0, len(clause), max_chars)
+                )
+            elif not current or len(current) + len(clause) <= max_chars:
+                current += clause
+            else:
+                chunks.append(current)
+                current = clause
+        if current:
+            chunks.append(current)
+        if len(chunks) <= 1:
+            result.append(SubtitleSegment(seg.start, seg.end, text))
+            continue
+
+        total_weight = sum(max(len(chunk), 1) for chunk in chunks)
+        duration = max(seg.end - seg.start, 0.001)
+        cursor = seg.start
+        consumed_weight = 0
+        for index, chunk in enumerate(chunks):
+            consumed_weight += max(len(chunk), 1)
+            end = seg.end if index == len(chunks) - 1 else seg.start + duration * consumed_weight / total_weight
+            result.append(SubtitleSegment(cursor, end, chunk))
+            cursor = end
+        split_count += len(chunks) - 1
+    if split_count:
+        print(f"Subtitle layout: split {split_count} oversized cue(s) to prevent three-line subtitles.", flush=True)
+    return result
+
+
 def simplify_segments(segments: list[SubtitleSegment]) -> list[SubtitleSegment]:
     """Convert Chinese subtitle text to Simplified Chinese deterministically."""
     if _SIMPLIFIED_CONVERTER is None:
@@ -1560,6 +1611,7 @@ def write_srt_from_segments(segments: list[SubtitleSegment], srt_path: Path) -> 
     """Write sanitized segments to an SRT file. Returns the number of segments written."""
     clean = sanitize_segments(segments)
     clean = strip_known_hallucinations(clean)
+    clean = split_long_segments(clean)
     clean = smooth_dense_segments(clean)
     with srt_path.open("w", encoding="utf-8") as handle:
         for i, seg in enumerate(clean, 1):

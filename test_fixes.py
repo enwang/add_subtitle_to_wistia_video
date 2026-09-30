@@ -34,6 +34,7 @@ from wistia_srt import (
     sanitize_segments,
     simplify_segments,
     smooth_dense_segments,
+    split_long_segments,
     suspect_segment_indexes,
     timestamp,
     write_srt_from_segments,
@@ -224,6 +225,15 @@ def test_fix1g_local_candidate_filter_and_timing_smoothing():
         SubtitleSegment(start=0.8, end=2.0, text="第三句内容"),
     ])
     check("Fast adjacent captions are merged", len(dense) < 3, str(dense))
+
+    long_text = "这个位置需要继续观察，因为市场仍然有不少不确定因素，而且成交量和利率走势都可能影响后面的方向，所以暂时不要急着追高。"
+    split = split_long_segments([SubtitleSegment(start=10.0, end=18.0, text=long_text)])
+    check("Long cue is split into multiple display cues", len(split) >= 2, str(split))
+    check("Every display cue stays within two-line length budget",
+          all(len(seg.text) <= 42 for seg in split), str([len(seg.text) for seg in split]))
+    check("Split cues preserve the original timeline",
+          split[0].start == 10.0 and split[-1].end == 18.0
+          and all(left.end == right.start for left, right in zip(split, split[1:])))
 
 
 # ══════════════════════════════════════════════════════════════════════════════

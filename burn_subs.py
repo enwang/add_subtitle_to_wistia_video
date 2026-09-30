@@ -15,7 +15,7 @@ def ffmpeg_subtitles_arg(path: Path) -> str:
     raw = str(path.resolve())
     raw = raw.replace("\\", "\\\\").replace(":", r"\:").replace("'", r"\'")
     style = (
-        "FontName=PingFang SC,"
+        "FontName=Heiti SC,"
         "FontSize=20,"
         "PrimaryColour=&H00FFFFFF,"
         "OutlineColour=&H00000000,"
