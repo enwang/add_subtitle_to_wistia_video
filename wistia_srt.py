@@ -15,6 +15,7 @@ import tempfile
 import textwrap
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 from urllib.parse import parse_qs, urlencode, urljoin, urlparse
@@ -223,6 +224,58 @@ def resolve_wistia_mp4_url(url: str, target_height: int | None = None) -> str:
         flush=True,
     )
     return selected["url"]
+
+
+def wistia_output_name(metadata: dict) -> str | None:
+    """Build the organized JLaw filename from Wistia's upload metadata."""
+    media = metadata.get("media", {})
+    source_name = Path(str(media.get("name") or "")).name
+    normalized_name = source_name.casefold()
+
+    created_at = media.get("createdAt")
+    try:
+        upload_year = datetime.fromtimestamp(float(created_at), timezone.utc).year
+    except (TypeError, ValueError, OSError):
+        upload_year = datetime.now(timezone.utc).year
+
+    date_match = re.search(r"(?<!\d)(\d{2})(\d{2})(?!\d)", normalized_name)
+    if not date_match:
+        return None
+    month, day = map(int, date_match.groups())
+    try:
+        upload_date = datetime(upload_year, month, day).date().isoformat()
+    except ValueError:
+        return None
+
+    if any(marker in normalized_name for marker in ("q&a", "qa", "coaching")):
+        category = "Q&A"
+    elif any(marker in normalized_name for marker in ("chart", "圖表", "图表")):
+        category = "图表"
+    elif re.search(r"\d{4}m(?:_|\.|$)", normalized_name):
+        # JLaw's `MMDDm_` uploads contain the weekly market and chart lesson.
+        category = "大盘+图表"
+    else:
+        return None
+    return f"{upload_date}_{category}.mp4"
+
+
+def wistia_default_output(url: str) -> Path | None:
+    media_id = extract_wistia_media_id(url)
+    if not media_id:
+        return None
+    try:
+        metadata = fetch_json(f"https://fast.wistia.net/embed/medias/{media_id}.json")
+    except Exception as exc:
+        print(f"Wistia naming metadata lookup failed ({exc}); using the media id.", flush=True)
+        return None
+    output_name = wistia_output_name(metadata)
+    if not output_name:
+        print(
+            "Wistia metadata did not contain a recognized JLaw date/type; using the media id.",
+            flush=True,
+        )
+        return None
+    return Path.home() / "Downloads" / "JLaw Videos" / output_name
 
 
 def extract_google_drive_file_id(url: str) -> str | None:
@@ -1844,8 +1897,8 @@ def parse_args() -> argparse.Namespace:
         "--output",
         help=(
             "Output MP4 path. Raymond But/畢兄 YouTube videos default to "
-            "~/Downloads/QP/<date>_QP.mp4; other videos default to "
-            "~/Downloads/JLaw Videos/<stream-id>.subtitled.mp4."
+            "~/Downloads/QP/<date>_QP.mp4; recognized JLaw Wistia videos default to "
+            "~/Downloads/JLaw Videos/<date>_<type>.mp4; other videos use the stream id."
         ),
     )
     parser.add_argument(
@@ -1985,10 +2038,12 @@ def main() -> int:
 
     stem = safe_stem(args.url)
     input_url = args.url
+    detected_output = wistia_default_output(input_url)
     if not is_google_drive_url(input_url) and not is_youtube_url(input_url):
         input_url = resolve_wistia_mp4_url(input_url, args.wistia_height)
     default_output_dir = Path.home() / "Downloads" / "JLaw Videos"
-    detected_output = youtube_default_output(input_url) if is_youtube_url(input_url) else None
+    if is_youtube_url(input_url):
+        detected_output = youtube_default_output(input_url)
     output_path = (
         Path(args.output)
         if args.output

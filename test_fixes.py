@@ -31,6 +31,7 @@ from wistia_srt import (
     resolve_google_drive_virus_warning_url,
     resolve_google_drive_download_url,
     resolve_wistia_mp4_url,
+    wistia_output_name,
     sanitize_segments,
     simplify_segments,
     smooth_dense_segments,
@@ -499,6 +500,19 @@ def test_wistia_resolver_selects_direct_mp4():
           f"got {height_resolved}")
 
 
+def test_wistia_output_name():
+    metadata = {
+        "media": {
+            "name": "file-uploads/sites/106093/video/example_1002m_.mp4",
+            "createdAt": 1790925124,
+        }
+    }
+    check("JLaw MMDDm upload gets its organized date/type filename",
+          wistia_output_name(metadata) == "2026-10-02_大盘+图表.mp4")
+    check("Unknown Wistia names do not receive a guessed category",
+          wistia_output_name({"media": {"name": "random.mp4"}}) is None)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # YouTube resolver: supported URL shapes share the same subtitle pipeline
 # ══════════════════════════════════════════════════════════════════════════════
@@ -855,6 +869,7 @@ if __name__ == "__main__":
     test_fix3_failed_clip_graceful()
     test_integration_srt_output()
     test_wistia_resolver_selects_direct_mp4()
+    test_wistia_output_name()
     test_youtube_video_id_extraction()
     test_qp_output_name()
     test_input_url_normalization()
