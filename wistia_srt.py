@@ -722,7 +722,7 @@ def ffmpeg_subtitles_arg(path: Path) -> str:
     raw = raw.replace("\\", "\\\\").replace(":", r"\:").replace("'", r"\'")
     style = (
         "FontName=Heiti SC,"
-        "FontSize=20,"
+        "FontSize=16,"
         "PrimaryColour=&H00FFFFFF,"
         "OutlineColour=&H00000000,"
         "BackColour=&H00000000,"

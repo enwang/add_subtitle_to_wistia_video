@@ -570,6 +570,9 @@ def test_existing_subtitle_cover_filter():
     check("Default filter does not cover source video",
           default_filter.startswith("subtitles=") and "drawbox" not in default_filter,
           default_filter)
+    check("Subtitle font remains compact on high-resolution videos",
+          "FontSize=16" in default_filter,
+          default_filter)
     check("Cover filter draws black box before burning new subtitles",
           cover_filter.startswith("drawbox=") and ",subtitles=" in cover_filter,
           cover_filter)
