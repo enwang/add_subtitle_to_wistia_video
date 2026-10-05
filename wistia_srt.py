@@ -1652,17 +1652,44 @@ _FINANCIAL_TERM_CORRECTIONS: tuple[tuple[str, str], ...] = (
     ("拍埋線", "抛物线"),
 )
 
+_FINANCIAL_TERM_REGEX_CORRECTIONS: tuple[tuple[str, str], ...] = (
+    (r"(?<![A-Za-z])wits[\s-]*on(?![A-Za-z])", "risk-on"),
+    (r"(?<![A-Za-z])wits[\s-]*off(?![A-Za-z])", "risk-off"),
+)
+
 
 def correct_financial_terms(segments: list[SubtitleSegment]) -> list[SubtitleSegment]:
     """Correct deterministic Cantonese/finance transcription confusions."""
     corrected: list[SubtitleSegment] = []
     correction_count = 0
-    for seg in segments:
+    for index, seg in enumerate(segments):
         text = seg.text
         for source, target in _FINANCIAL_TERM_CORRECTIONS:
             if source in text:
                 text = text.replace(source, target)
                 correction_count += 1
+        for pattern, target in _FINANCIAL_TERM_REGEX_CORRECTIONS:
+            text, replacements = re.subn(pattern, target, text, flags=re.IGNORECASE)
+            correction_count += replacements
+
+        # Whisper sometimes splits "risk-off" as trailing "wit" + leading
+        # "s off" across two adjacent subtitle cues.
+        if index + 1 < len(segments) and re.search(
+            r"(?<![A-Za-z])wit$", text, re.IGNORECASE
+        ):
+            next_text = segments[index + 1].text
+            if re.match(r"^s[\s-]*off\b", next_text, re.IGNORECASE):
+                text = re.sub(
+                    r"(?<![A-Za-z])wit$", "risk-off", text, flags=re.IGNORECASE
+                )
+                correction_count += 1
+        if index > 0 and re.search(
+            r"(?<![A-Za-z])wit$", segments[index - 1].text, re.IGNORECASE
+        ):
+            text, replacements = re.subn(
+                r"^s[\s-]*off\s*", "", text, count=1, flags=re.IGNORECASE
+            )
+            correction_count += replacements
         corrected.append(SubtitleSegment(seg.start, seg.end, text))
     if correction_count:
         print(f"Financial terminology: applied {correction_count} correction(s).", flush=True)

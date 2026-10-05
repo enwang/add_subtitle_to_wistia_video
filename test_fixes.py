@@ -215,12 +215,20 @@ def test_financial_term_corrections():
     segments = [
         SubtitleSegment(0.0, 2.0, "债息现在是一个拍马线状态"),
         SubtitleSegment(2.0, 4.0, "处于一个拍埋線的状态"),
+        SubtitleSegment(4.0, 6.0, "现在是wits on情况，不是WITS OFF"),
+        SubtitleSegment(6.0, 8.0, "到底是wits on neutral 还是wit"),
+        SubtitleSegment(8.0, 10.0, "s off PCE解释了"),
+        SubtitleSegment(10.0, 12.0, "在Witson中要低息环境"),
     ]
     corrected = correct_financial_terms(segments)
-    check("Parabolic-line mistranscriptions are corrected",
+    check("Finance and chart terminology mistranscriptions are corrected",
           [seg.text for seg in corrected] == [
               "债息现在是一个抛物线状态",
               "处于一个抛物线的状态",
+              "现在是risk-on情况，不是risk-off",
+              "到底是risk-on neutral 还是risk-off",
+              "PCE解释了",
+              "在risk-on中要低息环境",
           ])
 
 
