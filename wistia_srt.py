@@ -1650,6 +1650,8 @@ _FINANCIAL_TERM_CORRECTIONS: tuple[tuple[str, str], ...] = (
     ("拍馬線", "抛物线"),
     ("拍埋线", "抛物线"),
     ("拍埋線", "抛物线"),
+    ("公干", "杠杆"),
+    ("公幹", "杠杆"),
 )
 
 _FINANCIAL_TERM_REGEX_CORRECTIONS: tuple[tuple[str, str], ...] = (

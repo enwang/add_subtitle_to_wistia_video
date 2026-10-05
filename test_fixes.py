@@ -219,6 +219,8 @@ def test_financial_term_corrections():
         SubtitleSegment(6.0, 8.0, "到底是wits on neutral 还是wit"),
         SubtitleSegment(8.0, 10.0, "s off PCE解释了"),
         SubtitleSegment(10.0, 12.0, "在Witson中要低息环境"),
+        SubtitleSegment(12.0, 14.0, "然后通过公干来放大潜在回报"),
+        SubtitleSegment(14.0, 16.0, "不要使用过高的公幹"),
     ]
     corrected = correct_financial_terms(segments)
     check("Finance and chart terminology mistranscriptions are corrected",
@@ -229,6 +231,8 @@ def test_financial_term_corrections():
               "到底是risk-on neutral 还是risk-off",
               "PCE解释了",
               "在risk-on中要低息环境",
+              "然后通过杠杆来放大潜在回报",
+              "不要使用过高的杠杆",
           ])
 
 
