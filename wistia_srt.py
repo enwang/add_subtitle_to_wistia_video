@@ -1645,6 +1645,30 @@ def simplify_segments(segments: list[SubtitleSegment]) -> list[SubtitleSegment]:
     ]
 
 
+_FINANCIAL_TERM_CORRECTIONS: tuple[tuple[str, str], ...] = (
+    ("拍马线", "抛物线"),
+    ("拍馬線", "抛物线"),
+    ("拍埋线", "抛物线"),
+    ("拍埋線", "抛物线"),
+)
+
+
+def correct_financial_terms(segments: list[SubtitleSegment]) -> list[SubtitleSegment]:
+    """Correct deterministic Cantonese/finance transcription confusions."""
+    corrected: list[SubtitleSegment] = []
+    correction_count = 0
+    for seg in segments:
+        text = seg.text
+        for source, target in _FINANCIAL_TERM_CORRECTIONS:
+            if source in text:
+                text = text.replace(source, target)
+                correction_count += 1
+        corrected.append(SubtitleSegment(seg.start, seg.end, text))
+    if correction_count:
+        print(f"Financial terminology: applied {correction_count} correction(s).", flush=True)
+    return corrected
+
+
 def strip_known_hallucinations(segments: list[SubtitleSegment]) -> list[SubtitleSegment]:
     """Remove segments whose text contains a known Whisper hallucination phrase."""
     kept = []
@@ -1662,7 +1686,8 @@ def strip_known_hallucinations(segments: list[SubtitleSegment]) -> list[Subtitle
 
 def write_srt_from_segments(segments: list[SubtitleSegment], srt_path: Path) -> int:
     """Write sanitized segments to an SRT file. Returns the number of segments written."""
-    clean = sanitize_segments(segments)
+    clean = correct_financial_terms(segments)
+    clean = sanitize_segments(clean)
     clean = strip_known_hallucinations(clean)
     clean = split_long_segments(clean)
     clean = smooth_dense_segments(clean)

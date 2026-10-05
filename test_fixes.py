@@ -19,6 +19,7 @@ from wistia_srt import (
     SubtitleSegment,
     classify_chinese_subtitle_text,
     collapse_repetition_loops,
+    correct_financial_terms,
     download_google_drive_file,
     existing_subtitle_reason_from_probe,
     extract_youtube_video_id,
@@ -208,6 +209,19 @@ def test_fix1f_silence_hallucination_and_simplified_output():
     ])
     check("Traditional Chinese is converted to Simplified Chinese",
           converted[0].text == "这周市场会继续观察", converted[0].text)
+
+
+def test_financial_term_corrections():
+    segments = [
+        SubtitleSegment(0.0, 2.0, "债息现在是一个拍马线状态"),
+        SubtitleSegment(2.0, 4.0, "处于一个拍埋線的状态"),
+    ]
+    corrected = correct_financial_terms(segments)
+    check("Parabolic-line mistranscriptions are corrected",
+          [seg.text for seg in corrected] == [
+              "债息现在是一个抛物线状态",
+              "处于一个抛物线的状态",
+          ])
 
 
 def test_fix1g_local_candidate_filter_and_timing_smoothing():
@@ -864,6 +878,7 @@ if __name__ == "__main__":
     test_fix1d_phrase_repetition_loop_collapsed()
     test_fix1e_phrase_repetition_loop_is_hallucination()
     test_fix1f_silence_hallucination_and_simplified_output()
+    test_financial_term_corrections()
     test_fix1g_local_candidate_filter_and_timing_smoothing()
     test_fix2_condition_on_previous_text_param()
     test_fix3_gap_detected_and_filled()
