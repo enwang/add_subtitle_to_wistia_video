@@ -1652,6 +1652,9 @@ _FINANCIAL_TERM_CORRECTIONS: tuple[tuple[str, str], ...] = (
     ("拍埋線", "抛物线"),
     ("公干", "杠杆"),
     ("公幹", "杠杆"),
+    # Minervini's book title 《超级绩效》 is heard as "超级职校".
+    ("超级职校", "超级绩效"),
+    ("超級職校", "超级绩效"),
 )
 
 _FINANCIAL_TERM_REGEX_CORRECTIONS: tuple[tuple[str, str], ...] = (
@@ -1666,6 +1669,8 @@ _FINANCIAL_TERM_REGEX_CORRECTIONS: tuple[tuple[str, str], ...] = (
     # "context" is heard as "contest"; keep genuine contest mentions
     # (trading contest / USIC contest) untouched.
     (r"(?<!trading\s)(?<!USIC\s)(?<![A-Za-z])contest(?![A-Za-z])", "context"),
+    # "TTT" is transcribed as "TDT".
+    (r"(?<![A-Za-z])TDT(?![A-Za-z])", "TTT"),
 )
 
 
