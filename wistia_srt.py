@@ -1259,22 +1259,18 @@ def _apply_proofread_corrections(
     return result
 
 
-def _call_codex_proofread(
+def _proofread_prompt(
     segments: list[SubtitleSegment],
     chunk_indexes: list[int],
     language: str | None,
-) -> dict[int, str]:
-    """Ask local Codex to proofread one chunk of subtitles (global indexes)."""
-    executable = codex_binary()
-    if not executable:
-        raise RuntimeError("Codex executable not found; install Codex or the ChatGPT desktop app")
-
+) -> str:
+    """Shared proofreading prompt for the Codex and Ollama backends."""
     lang_hint = f" The video is in language code '{language}'." if language else ""
     lines = [
         f"{index}: [{timestamp(segments[index].start)}] {segments[index].text}"
         for index in chunk_indexes
     ]
-    prompt = (
+    return (
         f"You are proofreading auto-generated subtitles for a Cantonese/Mandarin financial video (US stock swing trading).{lang_hint}\n"
         "Each line has a GLOBAL INDEX. Return corrections ONLY for lines that contain transcription errors.\n\n"
         "Error classes to fix:\n"
@@ -1288,30 +1284,59 @@ def _call_codex_proofread(
         "If a line is correct, or you are not confident it is wrong, omit it.\n\n"
         "Segments:\n" + "\n".join(lines)
     )
-    schema = {
-        "type": "object",
-        "properties": {
-            "corrections": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "index": {"type": "integer"},
-                        "text": {"type": "string"},
-                    },
-                    "required": ["index", "text"],
-                    "additionalProperties": False,
+_PROOFREAD_SCHEMA: dict = {
+    "type": "object",
+    "properties": {
+        "corrections": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "index": {"type": "integer"},
+                    "text": {"type": "string"},
                 },
-            }
-        },
-        "required": ["corrections"],
-        "additionalProperties": False,
-    }
+                "required": ["index", "text"],
+                "additionalProperties": False,
+            },
+        }
+    },
+    "required": ["corrections"],
+    "additionalProperties": False,
+}
+
+_PROOFREAD_MODEL = os.environ.get("JLAW_PROOFREAD_MODEL", "qwen2.5:14b")
+_OLLAMA_URL = os.environ.get("JLAW_OLLAMA_URL", "http://127.0.0.1:11434")
+
+
+def _extract_proofread_corrections(
+    result: dict,
+    chunk_indexes: list[int],
+) -> dict[int, str]:
+    """Keep only well-formed corrections for indexes inside this chunk."""
+    corrections: dict[int, str] = {}
+    chunk_set = set(chunk_indexes)
+    for item in result.get("corrections") or []:
+        index = item.get("index")
+        if isinstance(index, int) and index in chunk_set and isinstance(item.get("text"), str):
+            corrections[index] = item["text"]
+    return corrections
+
+
+def _call_codex_proofread(
+    segments: list[SubtitleSegment],
+    chunk_indexes: list[int],
+    language: str | None,
+) -> dict[int, str]:
+    """Ask local Codex to proofread one chunk of subtitles (global indexes)."""
+    executable = codex_binary()
+    if not executable:
+        raise RuntimeError("Codex executable not found; install Codex or the ChatGPT desktop app")
+    prompt = _proofread_prompt(segments, chunk_indexes, language)
 
     with tempfile.TemporaryDirectory(prefix="jlaw-codex-proofread-") as tmpdir:
         schema_path = Path(tmpdir) / "schema.json"
         output_path = Path(tmpdir) / "result.json"
-        schema_path.write_text(json.dumps(schema, ensure_ascii=False), encoding="utf-8")
+        schema_path.write_text(json.dumps(_PROOFREAD_SCHEMA, ensure_ascii=False), encoding="utf-8")
         completed = subprocess.run(
             [
                 executable, "exec", "--ephemeral", "--sandbox", "read-only",
@@ -1330,40 +1355,105 @@ def _call_codex_proofread(
             raise RuntimeError(f"Codex exited with status {completed.returncode}: {detail}")
         result = json.loads(output_path.read_text(encoding="utf-8"))
 
-    corrections: dict[int, str] = {}
-    chunk_set = set(chunk_indexes)
-    for item in result.get("corrections") or []:
-        index = item.get("index")
-        if isinstance(index, int) and index in chunk_set and isinstance(item.get("text"), str):
-            corrections[index] = item["text"]
-    return corrections
+    return _extract_proofread_corrections(result, chunk_indexes)
+
+
+def _ollama_available() -> bool:
+    """True when a local Ollama server responds and the proofread model is pulled."""
+    try:
+        with urlopen(f"{_OLLAMA_URL}/api/tags", timeout=3) as resp:
+            tags = json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return False
+    names = {str(m.get("name", "")) for m in tags.get("models") or []}
+    if _PROOFREAD_MODEL in names:
+        return True
+    base = _PROOFREAD_MODEL.split(":")[0]
+    return ":" not in _PROOFREAD_MODEL and any(n.split(":")[0] == base for n in names)
+
+
+def _call_ollama_proofread(
+    segments: list[SubtitleSegment],
+    chunk_indexes: list[int],
+    language: str | None,
+) -> dict[int, str]:
+    """Ask the local Ollama model to proofread one chunk of subtitles."""
+    prompt = _proofread_prompt(segments, chunk_indexes, language)
+    payload = {
+        "model": _PROOFREAD_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": False,
+        "format": _PROOFREAD_SCHEMA,
+        "options": {"temperature": 0},
+    }
+    request = Request(
+        f"{_OLLAMA_URL}/api/chat",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urlopen(request, timeout=600) as resp:
+        body = json.loads(resp.read().decode("utf-8"))
+    content = (body.get("message") or {}).get("content") or ""
+    result = json.loads(content)
+    return _extract_proofread_corrections(result, chunk_indexes)
+
+
+def _proofread_chunk(
+    segments: list[SubtitleSegment],
+    chunk_indexes: list[int],
+    language: str | None,
+) -> dict[int, str]:
+    """Proofread one chunk: Ollama first (local, free), Codex as fallback.
+
+    JLAW_PROOFREAD_BACKEND=ollama|codex forces a single backend.
+    """
+    backend = os.environ.get("JLAW_PROOFREAD_BACKEND", "auto").lower()
+    errors: list[str] = []
+    if backend in ("auto", "ollama"):
+        if _ollama_available():
+            try:
+                return _call_ollama_proofread(segments, chunk_indexes, language)
+            except Exception as exc:
+                errors.append(f"Ollama failed: {exc}")
+        else:
+            errors.append(f"Ollama unavailable (server down or model {_PROOFREAD_MODEL} not pulled)")
+        if backend == "ollama":
+            raise RuntimeError("; ".join(errors))
+    if backend in ("auto", "codex"):
+        try:
+            return _call_codex_proofread(segments, chunk_indexes, language)
+        except Exception as exc:
+            errors.append(f"Codex failed: {exc}")
+    raise RuntimeError("No proofread backend available (" + "; ".join(errors) + ")")
 
 
 def proofread_segments(
     segments: list[SubtitleSegment],
     language: str | None,
 ) -> list[SubtitleSegment]:
-    """Full-transcript Codex proofread for homophone/term errors.
+    """Full-transcript proofread for homophone/term errors.
 
     Unlike check_coherence (flag-only, heuristic subset), this reviews every
-    segment and rewrites the wrong words in place. Fail-open: any failure
+    segment and rewrites the wrong words in place, using a local LLM
+    (Ollama/Qwen by default, Codex as fallback). Fail-open: any failure
     returns the original segments untouched. Set JLAW_SKIP_PROOFREAD=1 to
     disable.
     """
     if not segments or os.environ.get("JLAW_SKIP_PROOFREAD"):
         return segments
     try:
-        print(f"Codex proofread: reviewing all {len(segments)} segment(s)...", flush=True)
+        print(f"Proofread: reviewing all {len(segments)} segment(s)...", flush=True)
         corrections: dict[int, str] = {}
         for start in range(0, len(segments), _PROOFREAD_CHUNK_SIZE):
             chunk = list(range(start, min(start + _PROOFREAD_CHUNK_SIZE, len(segments))))
-            corrections.update(_call_codex_proofread(segments, chunk, language))
+            corrections.update(_proofread_chunk(segments, chunk, language))
         if not corrections:
-            print("Codex proofread: no corrections suggested.", flush=True)
+            print("Proofread: no corrections suggested.", flush=True)
             return segments
         return _apply_proofread_corrections(segments, corrections)
     except Exception as exc:
-        print(f"\nCodex proofread failed ({exc}), keeping original subtitles.", flush=True)
+        print(f"\nProofread failed ({exc}), keeping original subtitles.", flush=True)
         return segments
 
 

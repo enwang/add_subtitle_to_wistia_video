@@ -19,6 +19,7 @@ from wistia_srt import (
     _DOMAIN_GLOSSARY_TERMS,
     _SIMPLIFIED_CHINESE_PROMPT,
     _apply_proofread_corrections,
+    _extract_proofread_corrections,
     SubtitleSegment,
     classify_chinese_subtitle_text,
     collapse_repetition_loops,
@@ -280,6 +281,17 @@ def test_proofread_corrections():
     check("Untouched and runaway-rewrite segments are preserved",
           corrected[2].text == "保持不动的一句"
           and corrected[3].text == "短句")
+    extracted = _extract_proofread_corrections(
+        {"corrections": [
+            {"index": 1, "text": "改好的句子"},
+            {"index": 7, "text": "不属于本块的索引"},
+            {"index": 2, "text": 123},
+            {"index": "3", "text": "索引类型不对"},
+        ]},
+        [0, 1, 2, 3],
+    )
+    check("Backend result extraction keeps only in-chunk string corrections",
+          extracted == {1: "改好的句子"})
 
 
 def test_fix1g_local_candidate_filter_and_timing_smoothing():
