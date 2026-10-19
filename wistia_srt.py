@@ -1657,6 +1657,15 @@ _FINANCIAL_TERM_CORRECTIONS: tuple[tuple[str, str], ...] = (
 _FINANCIAL_TERM_REGEX_CORRECTIONS: tuple[tuple[str, str], ...] = (
     (r"(?<![A-Za-z])wits[\s-]*on(?![A-Za-z])", "risk-on"),
     (r"(?<![A-Za-z])wits[\s-]*off(?![A-Za-z])", "risk-off"),
+    # JLaw says "MYT" (his community); Whisper hears the university "MIT".
+    (r"(?<![A-Za-z])MIT(?![A-Za-z])", "MYT"),
+    (r"(?<![A-Za-z])M\.I\.T\.?(?![A-Za-z])", "MYT"),
+    # "Bill Ackman" loses syllables in transcription (Ackerman/Ekman/...).
+    (r"(?<![A-Za-z])Bill\s+(?:Ackermann|Ackerman|Ackmann|Akman|Ekman)(?![A-Za-z])", "Bill Ackman"),
+    (r"(?<![A-Za-z])(?:Ackermann|Ackerman|Ackmann)(?![A-Za-z])", "Ackman"),
+    # "context" is heard as "contest"; keep genuine contest mentions
+    # (trading contest / USIC contest) untouched.
+    (r"(?<!trading\s)(?<!USIC\s)(?<![A-Za-z])contest(?![A-Za-z])", "context"),
 )
 
 

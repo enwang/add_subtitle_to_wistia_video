@@ -221,6 +221,11 @@ def test_financial_term_corrections():
         SubtitleSegment(10.0, 12.0, "在Witson中要低息环境"),
         SubtitleSegment(12.0, 14.0, "然后通过公干来放大潜在回报"),
         SubtitleSegment(14.0, 16.0, "不要使用过高的公幹"),
+        SubtitleSegment(16.0, 18.0, "MIT的群友问了一个问题"),
+        SubtitleSegment(18.0, 20.0, "要结合当时的contest来判断"),
+        SubtitleSegment(20.0, 22.0, "他参加了trading contest所以没时间"),
+        SubtitleSegment(22.0, 24.0, "Bill Ackerman最近增持了这只股"),
+        SubtitleSegment(24.0, 26.0, "Ackermann的Pershing Square很有名"),
     ]
     corrected = correct_financial_terms(segments)
     check("Finance and chart terminology mistranscriptions are corrected",
@@ -233,6 +238,11 @@ def test_financial_term_corrections():
               "在risk-on中要低息环境",
               "然后通过杠杆来放大潜在回报",
               "不要使用过高的杠杆",
+              "MYT的群友问了一个问题",
+              "要结合当时的context来判断",
+              "他参加了trading contest所以没时间",
+              "Bill Ackman最近增持了这只股",
+              "Ackman的Pershing Square很有名",
           ])
 
 
