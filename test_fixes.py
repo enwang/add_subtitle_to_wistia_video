@@ -16,6 +16,9 @@ from pathlib import Path
 # ── import the functions under test ───────────────────────────────────────────
 sys.path.insert(0, str(Path(__file__).parent))
 from wistia_srt import (
+    _DOMAIN_GLOSSARY_TERMS,
+    _SIMPLIFIED_CHINESE_PROMPT,
+    _apply_proofread_corrections,
     SubtitleSegment,
     classify_chinese_subtitle_text,
     collapse_repetition_loops,
@@ -248,6 +251,35 @@ def test_financial_term_corrections():
               "他推荐了超级绩效这本书",
               "这个形态属于TTT的一种",
           ])
+
+
+def test_proofread_corrections():
+    print("\n── Proofread: glossary prompt and guarded correction application ──")
+    check("Glossary covers the reported homophone/term errors",
+          all(term in _DOMAIN_GLOSSARY_TERMS for term in
+              ("超级绩效", "保护本金", "本金", "杠杆", "MYT", "TTT",
+               "fat pitch", "context", "Bill Ackman")))
+    check("Whisper prompt embeds the glossary",
+          "本金" in _SIMPLIFIED_CHINESE_PROMPT
+          and "fat pitch" in _SIMPLIFIED_CHINESE_PROMPT)
+    segments = [
+        SubtitleSegment(0.0, 2.0, "首先要保护半金"),
+        SubtitleSegment(2.0, 4.0, "这是一个fab pitch的机会"),
+        SubtitleSegment(4.0, 6.0, "保持不动的一句"),
+        SubtitleSegment(6.0, 8.0, "短句"),
+    ]
+    corrected = _apply_proofread_corrections(segments, {
+        0: "首先要保护本金",
+        1: "这是一个fat pitch的机会",
+        3: "这是一个被大幅改写而且明显超出合理长度范围的句子不应该被接受下来",
+        99: "越界索引会被忽略",
+    })
+    check("Proofread corrections are applied",
+          corrected[0].text == "首先要保护本金"
+          and corrected[1].text == "这是一个fat pitch的机会")
+    check("Untouched and runaway-rewrite segments are preserved",
+          corrected[2].text == "保持不动的一句"
+          and corrected[3].text == "短句")
 
 
 def test_fix1g_local_candidate_filter_and_timing_smoothing():
@@ -905,6 +937,7 @@ if __name__ == "__main__":
     test_fix1e_phrase_repetition_loop_is_hallucination()
     test_fix1f_silence_hallucination_and_simplified_output()
     test_financial_term_corrections()
+    test_proofread_corrections()
     test_fix1g_local_candidate_filter_and_timing_smoothing()
     test_fix2_condition_on_previous_text_param()
     test_fix3_gap_detected_and_filled()

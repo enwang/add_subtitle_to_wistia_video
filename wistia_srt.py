@@ -38,8 +38,21 @@ try:
 except ImportError:
     _SIMPLIFIED_CONVERTER = None
 
-# Primer sentence in simplified Chinese — biases Whisper toward simplified characters
-_SIMPLIFIED_CHINESE_PROMPT = "以下是普通话或粤语财经视频的字幕内容。"
+# Primer for Whisper: simplified-Chinese framing plus a domain glossary.
+# Naming the expected finance terms up front steers the decoder toward them
+# and away from homophones (本金 not 半金, 绩效 not 职校, fat pitch not fab pitch).
+_DOMAIN_GLOSSARY_TERMS: tuple[str, ...] = (
+    "超级绩效", "保护本金", "本金", "杠杆", "抛物线", "止损", "止盈",
+    "加仓", "减仓", "仓位", "回撤", "突破", "支撑位", "阻力位",
+    "成交量", "均线", "财报", "股息",
+    "MYT", "TTT", "fat pitch", "risk-on", "risk-off", "context",
+    "Bill Ackman", "Minervini", "CANSLIM", "VCP", "PCE", "CPI", "drawdown",
+)
+_SIMPLIFIED_CHINESE_PROMPT = (
+    "以下是普通话或粤语财经视频的字幕内容。常出现术语："
+    + "、".join(_DOMAIN_GLOSSARY_TERMS)
+    + "。"
+)
 _DRIVE_CACHE_PATH = Path.home() / ".cache" / "jlaw_video" / "drive_cache.json"
 _DRIVE_OAUTH_TOKEN_PATH = Path.home() / ".cache" / "jlaw_video" / "google_drive_token.json"
 _DRIVE_OAUTH_CLIENT_PATH = Path.home() / ".config" / "jlaw_video" / "google_drive_client_secret.json"
@@ -1214,6 +1227,146 @@ def check_coherence(
         return []
 
 
+_PROOFREAD_CHUNK_SIZE = 60
+
+
+def _apply_proofread_corrections(
+    segments: list[SubtitleSegment],
+    corrections: dict[int, str],
+) -> list[SubtitleSegment]:
+    """Apply proofreading corrections, rejecting implausible rewrites.
+
+    A correction is accepted only when its length stays in a sane band
+    around the original — a guard against the reviewer rephrasing or
+    hallucinating content instead of fixing transcription errors.
+    """
+    result: list[SubtitleSegment] = []
+    applied = 0
+    for index, seg in enumerate(segments):
+        new_text = corrections.get(index)
+        if (
+            isinstance(new_text, str)
+            and new_text.strip()
+            and new_text != seg.text
+            and 0.4 * len(seg.text) <= len(new_text) <= 2.0 * len(seg.text) + 4
+        ):
+            result.append(SubtitleSegment(seg.start, seg.end, new_text))
+            applied += 1
+        else:
+            result.append(seg)
+    if applied:
+        print(f"Codex proofread: applied {applied} correction(s).", flush=True)
+    return result
+
+
+def _call_codex_proofread(
+    segments: list[SubtitleSegment],
+    chunk_indexes: list[int],
+    language: str | None,
+) -> dict[int, str]:
+    """Ask local Codex to proofread one chunk of subtitles (global indexes)."""
+    executable = codex_binary()
+    if not executable:
+        raise RuntimeError("Codex executable not found; install Codex or the ChatGPT desktop app")
+
+    lang_hint = f" The video is in language code '{language}'." if language else ""
+    lines = [
+        f"{index}: [{timestamp(segments[index].start)}] {segments[index].text}"
+        for index in chunk_indexes
+    ]
+    prompt = (
+        f"You are proofreading auto-generated subtitles for a Cantonese/Mandarin financial video (US stock swing trading).{lang_hint}\n"
+        "Each line has a GLOBAL INDEX. Return corrections ONLY for lines that contain transcription errors.\n\n"
+        "Error classes to fix:\n"
+        "1. Chinese homophone / near-homophone substitutions where the spoken finance term was written as a non-finance word. Judge from context: e.g. 保护半金 should be 保护本金, 超级职校 (a Minervini book) should be 超级绩效, 公干 should be 杠杆, 拍马线 should be 抛物线.\n"
+        "2. English finance terms and names mis-heard as similar-sounding words: e.g. 'fab pitch' should be 'fat pitch', 'MIT' should be 'MYT' (the speaker's community), 'contest' should be 'context' when it is not about a real competition, 'TDT' should be 'TTT', 'Bill Ackerman/Ekman' should be 'Bill Ackman'.\n"
+        "3. Any other obvious speech-recognition garble that breaks the sentence's meaning in context.\n\n"
+        "Expected terminology includes: " + ", ".join(_DOMAIN_GLOSSARY_TERMS) + ".\n\n"
+        "STRICT RULES: make the SMALLEST possible edit — fix only the wrong characters or words. "
+        "Never rephrase, expand, summarize, translate, or change numbers, prices, percentages, or stock tickers. "
+        "Mixed Chinese/English is normal; do not 'correct' code-switching. "
+        "If a line is correct, or you are not confident it is wrong, omit it.\n\n"
+        "Segments:\n" + "\n".join(lines)
+    )
+    schema = {
+        "type": "object",
+        "properties": {
+            "corrections": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "index": {"type": "integer"},
+                        "text": {"type": "string"},
+                    },
+                    "required": ["index", "text"],
+                    "additionalProperties": False,
+                },
+            }
+        },
+        "required": ["corrections"],
+        "additionalProperties": False,
+    }
+
+    with tempfile.TemporaryDirectory(prefix="jlaw-codex-proofread-") as tmpdir:
+        schema_path = Path(tmpdir) / "schema.json"
+        output_path = Path(tmpdir) / "result.json"
+        schema_path.write_text(json.dumps(schema, ensure_ascii=False), encoding="utf-8")
+        completed = subprocess.run(
+            [
+                executable, "exec", "--ephemeral", "--sandbox", "read-only",
+                "--skip-git-repo-check", "--output-schema", str(schema_path),
+                "--output-last-message", str(output_path), "--cd", tmpdir, "-",
+            ],
+            input=prompt,
+            text=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            timeout=300,
+            check=False,
+        )
+        if completed.returncode != 0:
+            detail = completed.stderr.strip().splitlines()[-1] if completed.stderr.strip() else "unknown error"
+            raise RuntimeError(f"Codex exited with status {completed.returncode}: {detail}")
+        result = json.loads(output_path.read_text(encoding="utf-8"))
+
+    corrections: dict[int, str] = {}
+    chunk_set = set(chunk_indexes)
+    for item in result.get("corrections") or []:
+        index = item.get("index")
+        if isinstance(index, int) and index in chunk_set and isinstance(item.get("text"), str):
+            corrections[index] = item["text"]
+    return corrections
+
+
+def proofread_segments(
+    segments: list[SubtitleSegment],
+    language: str | None,
+) -> list[SubtitleSegment]:
+    """Full-transcript Codex proofread for homophone/term errors.
+
+    Unlike check_coherence (flag-only, heuristic subset), this reviews every
+    segment and rewrites the wrong words in place. Fail-open: any failure
+    returns the original segments untouched. Set JLAW_SKIP_PROOFREAD=1 to
+    disable.
+    """
+    if not segments or os.environ.get("JLAW_SKIP_PROOFREAD"):
+        return segments
+    try:
+        print(f"Codex proofread: reviewing all {len(segments)} segment(s)...", flush=True)
+        corrections: dict[int, str] = {}
+        for start in range(0, len(segments), _PROOFREAD_CHUNK_SIZE):
+            chunk = list(range(start, min(start + _PROOFREAD_CHUNK_SIZE, len(segments))))
+            corrections.update(_call_codex_proofread(segments, chunk, language))
+        if not corrections:
+            print("Codex proofread: no corrections suggested.", flush=True)
+            return segments
+        return _apply_proofread_corrections(segments, corrections)
+    except Exception as exc:
+        print(f"\nCodex proofread failed ({exc}), keeping original subtitles.", flush=True)
+        return segments
+
+
 def verify_and_retry(
     segments: list[SubtitleSegment],
     audio_path: Path,
@@ -1836,6 +1989,7 @@ def _write_srt_mlx(
         subtitle_segments = verify_and_retry(subtitle_segments, audio_path, _mlx_transcribe_clip, language)
 
     subtitle_segments = retranscribe_hallucinations(subtitle_segments, audio_path, _mlx_transcribe_clip)
+    subtitle_segments = proofread_segments(subtitle_segments, language)
     if not traditional and task == "transcribe":
         subtitle_segments = simplify_segments(subtitle_segments)
 
@@ -1945,6 +2099,7 @@ def _write_srt_faster_whisper(
         subtitle_segments = verify_and_retry(subtitle_segments, audio_path, _fw_transcribe_clip, language)
 
     subtitle_segments = retranscribe_hallucinations(subtitle_segments, audio_path, _fw_transcribe_clip)
+    subtitle_segments = proofread_segments(subtitle_segments, language)
     if not traditional and task == "transcribe":
         subtitle_segments = simplify_segments(subtitle_segments)
 
