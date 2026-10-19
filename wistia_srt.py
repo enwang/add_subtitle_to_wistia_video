@@ -44,7 +44,7 @@ except ImportError:
 _DOMAIN_GLOSSARY_TERMS: tuple[str, ...] = (
     "超级绩效", "保护本金", "本金", "杠杆", "抛物线", "止损", "止盈",
     "加仓", "减仓", "仓位", "回撤", "突破", "支撑位", "阻力位",
-    "成交量", "均线", "财报", "股息",
+    "成交量", "均线", "财报", "股息", "盘感",
     "MYT", "TTT", "fat pitch", "risk-on", "risk-off", "context",
     "Bill Ackman", "Minervini", "CANSLIM", "VCP", "PCE", "CPI", "drawdown",
 )
@@ -1274,7 +1274,7 @@ def _proofread_prompt(
         f"You are proofreading auto-generated subtitles for a Cantonese/Mandarin financial video (US stock swing trading).{lang_hint}\n"
         "Each line has a GLOBAL INDEX. Return corrections ONLY for lines that contain transcription errors.\n\n"
         "Error classes to fix:\n"
-        "1. Chinese homophone / near-homophone substitutions where the spoken finance term was written as a non-finance word. Judge from context: e.g. 保护半金 should be 保护本金, 超级职校 (a Minervini book) should be 超级绩效, 公干 should be 杠杆, 拍马线 should be 抛物线.\n"
+        "1. Chinese homophone / near-homophone substitutions where the spoken finance term was written as a non-finance word. Judge from context: e.g. 保护半金 should be 保护本金, 超级职校 (a Minervini book) should be 超级绩效, 公干 should be 杠杆, 拍马线 should be 抛物线, 本感 should be 盘感.\n"
         "2. English finance terms and names mis-heard as similar-sounding words: e.g. 'fab pitch' should be 'fat pitch', 'MIT' should be 'MYT' (the speaker's community), 'contest' should be 'context' when it is not about a real competition, 'TDT' should be 'TTT', 'Bill Ackerman/Ekman' should be 'Bill Ackman'.\n"
         "3. Any other obvious speech-recognition garble that breaks the sentence's meaning in context.\n\n"
         "Expected terminology includes: " + ", ".join(_DOMAIN_GLOSSARY_TERMS) + ".\n\n"
